@@ -88,7 +88,7 @@ setup(
     long_description_content_type='text/markdown',
     author='Loren Eteval',
     author_email='loren.eteval@proton.me',
-    url='https://github.com/LorenEteval/hysteria-python',
+    url='https://github.com/LorenEteval/hysteria2-python',
     cmdclass={'install': InstallHysteria},
     packages=find_packages(),
     include_package_data=True,
