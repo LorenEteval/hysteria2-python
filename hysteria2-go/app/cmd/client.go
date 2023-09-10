@@ -393,15 +393,24 @@ func StartFromJSON(json string) {
 	logrus.Info("client mode")
 
 	if err := viper.ReadConfigJSON(bytes.NewReader([]byte(json))); err != nil {
-		logrus.Fatal("failed to read client config", zap.Error(err))
+		logrus.Error("failed to read client config", zap.Error(err))
+
+		// Xray-core: Configuration error
+		os.Exit(23)
 	}
 	var config clientConfig
 	if err := viper.Unmarshal(&config); err != nil {
-		logrus.Fatal("failed to parse client config", zap.Error(err))
+		logrus.Error("failed to parse client config", zap.Error(err))
+
+		// Xray-core: Configuration error
+		os.Exit(23)
 	}
 	hyConfig, err := config.Config()
 	if err != nil {
-		logrus.Fatal("failed to load client config", zap.Error(err))
+		logrus.Error("failed to load client config", zap.Error(err))
+
+		// Xray-core: Configuration error
+		os.Exit(23)
 	}
 
 	c, err := client.NewReconnectableClient(hyConfig, func(c client.Client, count int) {
@@ -415,7 +424,10 @@ func StartFromJSON(json string) {
 		//}
 	}, config.Lazy)
 	if err != nil {
-		logrus.Fatal("failed to initialize client", zap.Error(err))
+		logrus.Error("failed to initialize client", zap.Error(err))
+
+		// Xray-core: Client start failure
+		os.Exit(-1)
 	}
 	defer c.Close()
 
