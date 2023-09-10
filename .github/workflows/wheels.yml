@@ -1,9 +1,9 @@
-name: Build hysteria binding
+name: Build hysteria2 binding
 
 on: [push, pull_request]
 
 jobs:
-  build_hysteria:
+  build_hysteria2:
     name: ${{ matrix.os }} Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
     strategy:
