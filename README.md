@@ -1,6 +1,6 @@
 # hysteria2-python
 
-[![Build hysteria binding](https://github.com/LorenEteval/hysteria2-python/actions/workflows/wheels.yml/badge.svg?branch=main)](https://github.com/LorenEteval/hysteria2-python/actions/workflows/wheels.yml)
+[![Build hysteria2 binding](https://github.com/LorenEteval/hysteria2-python/actions/workflows/wheels.yml/badge.svg?branch=main)](https://github.com/LorenEteval/hysteria2-python/actions/workflows/wheels.yml)
 
 Python bindings for [hysteria2](https://github.com/apernet/hysteria). This package provides a bridge to start hysteria
 client directly from Python on any platform.
