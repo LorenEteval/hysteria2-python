@@ -3,15 +3,19 @@ package cmd
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/caddyserver/certmagic"
+	"github.com/mholt/acmez/acme"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -19,6 +23,7 @@ import (
 	"github.com/apernet/hysteria/app/internal/utils"
 	"github.com/apernet/hysteria/core/server"
 	"github.com/apernet/hysteria/extras/auth"
+	"github.com/apernet/hysteria/extras/masq"
 	"github.com/apernet/hysteria/extras/obfs"
 	"github.com/apernet/hysteria/extras/outbounds"
 	"github.com/apernet/hysteria/extras/trafficlogger"
@@ -177,9 +182,12 @@ type serverConfigMasqueradeProxy struct {
 }
 
 type serverConfigMasquerade struct {
-	Type  string                      `mapstructure:"type"`
-	File  serverConfigMasqueradeFile  `mapstructure:"file"`
-	Proxy serverConfigMasqueradeProxy `mapstructure:"proxy"`
+	Type        string                      `mapstructure:"type"`
+	File        serverConfigMasqueradeFile  `mapstructure:"file"`
+	Proxy       serverConfigMasqueradeProxy `mapstructure:"proxy"`
+	ListenHTTP  string                      `mapstructure:"listenHTTP"`
+	ListenHTTPS string                      `mapstructure:"listenHTTPS"`
+	ForceHTTPS  bool                        `mapstructure:"forceHTTPS"`
 }
 
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
@@ -232,7 +240,11 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 		// ACME
 		dataDir := c.ACME.Dir
 		if dataDir == "" {
-			dataDir = "acme"
+			// If not specified in the config, check the environment variable
+			// before resorting to the default "acme" value. The main reason
+			// we have this is so that our setup script can set it to the
+			// user's home directory.
+			dataDir = envOrDefaultString(appACMEDirEnv, "acme")
 		}
 		cmCfg := &certmagic.Config{
 			RenewalWindowRatio: certmagic.DefaultRenewalWindowRatio,
@@ -255,6 +267,11 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			cmIssuer.CA = certmagic.LetsEncryptProductionCA
 		case "zerossl", "zero":
 			cmIssuer.CA = certmagic.ZeroSSLProductionCA
+			eab, err := genZeroSSLEAB(c.ACME.Email)
+			if err != nil {
+				return configError{Field: "acme.ca", Err: err}
+			}
+			cmIssuer.ExternalAccount = eab
 		default:
 			return configError{Field: "acme.ca", Err: errors.New("unknown CA")}
 		}
@@ -277,6 +294,48 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 		hyConfig.TLSConfig.GetCertificate = cmCfg.GetCertificate
 	}
 	return nil
+}
+
+func genZeroSSLEAB(email string) (*acme.EAB, error) {
+	req, err := http.NewRequest(
+		http.MethodPost,
+		"https://api.zerossl.com/acme/eab-credentials-email",
+		strings.NewReader(url.Values{"email": []string{email}}.Encode()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to creare ZeroSSL EAB request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", certmagic.UserAgent)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send ZeroSSL EAB request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var result struct {
+		Success bool `json:"success"`
+		Error   struct {
+			Code int    `json:"code"`
+			Type string `json:"type"`
+		} `json:"error"`
+		EABKID     string `json:"eab_kid"`
+		EABHMACKey string `json:"eab_hmac_key"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed decoding ZeroSSL EAB API response: %w", err)
+	}
+	if result.Error.Code != 0 {
+		return nil, fmt.Errorf("failed getting ZeroSSL EAB credentials: HTTP %d: %s (code %d)", resp.StatusCode, result.Error.Type, result.Error.Code)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed getting EAB credentials: HTTP %d", resp.StatusCode)
+	}
+
+	return &acme.EAB{
+		KeyID:  result.EABKID,
+		MACKey: result.EABHMACKey,
+	}, nil
 }
 
 func (c *serverConfig) fillQUICConfig(hyConfig *server.Config) error {
@@ -520,17 +579,18 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	return nil
 }
 
+// fillMasqHandler must be called after fillConn, as we may need to extract the QUIC
+// port number from Conn for MasqTCPServer.
 func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
+	var handler http.Handler
 	switch strings.ToLower(c.Masquerade.Type) {
 	case "", "404":
-		hyConfig.MasqHandler = http.NotFoundHandler()
-		return nil
+		handler = http.NotFoundHandler()
 	case "file":
 		if c.Masquerade.File.Dir == "" {
 			return configError{Field: "masquerade.file.dir", Err: errors.New("empty file directory")}
 		}
-		hyConfig.MasqHandler = http.FileServer(http.Dir(c.Masquerade.File.Dir))
-		return nil
+		handler = http.FileServer(http.Dir(c.Masquerade.File.Dir))
 	case "proxy":
 		if c.Masquerade.Proxy.URL == "" {
 			return configError{Field: "masquerade.proxy.url", Err: errors.New("empty proxy url")}
@@ -539,7 +599,7 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 		if err != nil {
 			return configError{Field: "masquerade.proxy.url", Err: err}
 		}
-		hyConfig.MasqHandler = &httputil.ReverseProxy{
+		handler = &httputil.ReverseProxy{
 			Rewrite: func(r *httputil.ProxyRequest) {
 				r.SetURL(u)
 				// SetURL rewrites the Host header,
@@ -553,10 +613,28 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 				w.WriteHeader(http.StatusBadGateway)
 			},
 		}
-		return nil
 	default:
 		return configError{Field: "masquerade.type", Err: errors.New("unsupported masquerade type")}
 	}
+	hyConfig.MasqHandler = &masqHandlerLogWrapper{H: handler, QUIC: true}
+
+	if c.Masquerade.ListenHTTP != "" || c.Masquerade.ListenHTTPS != "" {
+		if c.Masquerade.ListenHTTP != "" && c.Masquerade.ListenHTTPS == "" {
+			return configError{Field: "masquerade.listenHTTPS", Err: errors.New("having only HTTP server without HTTPS is not supported")}
+		}
+		s := masq.MasqTCPServer{
+			QUICPort:  extractPortFromAddr(hyConfig.Conn.LocalAddr().String()),
+			HTTPSPort: extractPortFromAddr(c.Masquerade.ListenHTTPS),
+			Handler:   &masqHandlerLogWrapper{H: handler, QUIC: false},
+			TLSConfig: &tls.Config{
+				Certificates:   hyConfig.TLSConfig.Certificates,
+				GetCertificate: hyConfig.TLSConfig.GetCertificate,
+			},
+			ForceHTTPS: c.Masquerade.ForceHTTPS,
+		}
+		go runMasqTCPServer(&s, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS)
+	}
+	return nil
 }
 
 // Config validates the fields and returns a ready-to-use Hysteria server config
@@ -622,6 +700,26 @@ func runTrafficStatsServer(listen string, handler http.Handler) {
 	}
 }
 
+func runMasqTCPServer(s *masq.MasqTCPServer, httpAddr, httpsAddr string) {
+	errChan := make(chan error, 2)
+	if httpAddr != "" {
+		go func() {
+			logger.Info("masquerade HTTP server up and running", zap.String("listen", httpAddr))
+			errChan <- s.ListenAndServeHTTP(httpAddr)
+		}()
+	}
+	if httpsAddr != "" {
+		go func() {
+			logger.Info("masquerade HTTPS server up and running", zap.String("listen", httpsAddr))
+			errChan <- s.ListenAndServeHTTPS(httpsAddr)
+		}()
+	}
+	err := <-errChan
+	if err != nil {
+		logger.Fatal("failed to serve masquerade HTTP(S)", zap.Error(err))
+	}
+}
+
 func geoipDownloadFunc(filename, url string) {
 	logger.Info("downloading GeoIP database", zap.String("filename", filename), zap.String("url", url))
 }
@@ -664,4 +762,31 @@ func (l *serverLogger) UDPError(addr net.Addr, id string, sessionID uint32, err 
 	} else {
 		logger.Error("UDP error", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.Error(err))
 	}
+}
+
+type masqHandlerLogWrapper struct {
+	H    http.Handler
+	QUIC bool
+}
+
+func (m *masqHandlerLogWrapper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	logger.Debug("masquerade request",
+		zap.String("addr", r.RemoteAddr),
+		zap.String("method", r.Method),
+		zap.String("host", r.Host),
+		zap.String("url", r.URL.String()),
+		zap.Bool("quic", m.QUIC))
+	m.H.ServeHTTP(w, r)
+}
+
+func extractPortFromAddr(addr string) int {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0
+	}
+	return port
 }

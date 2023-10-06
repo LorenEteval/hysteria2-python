@@ -19,6 +19,7 @@ import (
 
 	"github.com/apernet/hysteria/app/internal/forwarding"
 	"github.com/apernet/hysteria/app/internal/http"
+	"github.com/apernet/hysteria/app/internal/redirect"
 	"github.com/apernet/hysteria/app/internal/socks5"
 	"github.com/apernet/hysteria/app/internal/tproxy"
 	"github.com/apernet/hysteria/app/internal/url"
@@ -26,8 +27,6 @@ import (
 	"github.com/apernet/hysteria/core/client"
 	"github.com/apernet/hysteria/extras/obfs"
 	"github.com/apernet/hysteria/extras/transport/udphop"
-
-	"github.com/sirupsen/logrus"
 )
 
 // Client flags
@@ -66,6 +65,7 @@ type clientConfig struct {
 	UDPForwarding []udpForwardingEntry  `mapstructure:"udpForwarding"`
 	TCPTProxy     *tcpTProxyConfig      `mapstructure:"tcpTProxy"`
 	UDPTProxy     *udpTProxyConfig      `mapstructure:"udpTProxy"`
+	TCPRedirect   *tcpRedirectConfig    `mapstructure:"tcpRedirect"`
 }
 
 type clientConfigTransportUDP struct {
@@ -140,6 +140,10 @@ type tcpTProxyConfig struct {
 type udpTProxyConfig struct {
 	Listen  string        `mapstructure:"listen"`
 	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+type tcpRedirectConfig struct {
+	Listen string `mapstructure:"listen"`
 }
 
 func (c *clientConfig) fillServerAddr(hyConfig *client.Config) error {
@@ -387,27 +391,26 @@ func (c *clientConfig) Config() (*client.Config, error) {
 
 func StartFromJSON(json string) {
 	// client mode
-	// try to suppress all log info
-	logrus.SetLevel(logrus.FatalLevel)
+	InitLogger()
 
-	logrus.Info("client mode")
+	logger.Info("client mode")
 
 	if err := viper.ReadConfigJSON(bytes.NewReader([]byte(json))); err != nil {
-		logrus.Error("failed to read client config", zap.Error(err))
+		logger.Error("failed to read client config", zap.Error(err))
 
 		// Xray-core: Configuration error
 		os.Exit(23)
 	}
 	var config clientConfig
 	if err := viper.Unmarshal(&config); err != nil {
-		logrus.Error("failed to parse client config", zap.Error(err))
+		logger.Error("failed to parse client config", zap.Error(err))
 
 		// Xray-core: Configuration error
 		os.Exit(23)
 	}
 	hyConfig, err := config.Config()
 	if err != nil {
-		logrus.Error("failed to load client config", zap.Error(err))
+		logger.Error("failed to load client config", zap.Error(err))
 
 		// Xray-core: Configuration error
 		os.Exit(23)
@@ -424,117 +427,10 @@ func StartFromJSON(json string) {
 		//}
 	}, config.Lazy)
 	if err != nil {
-		logrus.Error("failed to initialize client", zap.Error(err))
+		logger.Error("failed to initialize client", zap.Error(err))
 
 		// Xray-core: Client start failure
 		os.Exit(-1)
-	}
-	defer c.Close()
-
-	uri := config.URI()
-	logrus.Info("use this URI to share your server", zap.String("uri", uri))
-	if showQR {
-		utils.PrintQR(uri)
-	}
-
-	// Modes
-	var wg sync.WaitGroup
-	hasMode := false
-
-	if config.SOCKS5 != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientSOCKS5(*config.SOCKS5, c); err != nil {
-				logrus.Fatal("failed to run SOCKS5 server", zap.Error(err))
-			}
-		}()
-	}
-	if config.HTTP != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientHTTP(*config.HTTP, c); err != nil {
-				logrus.Fatal("failed to run HTTP proxy server", zap.Error(err))
-			}
-		}()
-	}
-	if len(config.TCPForwarding) > 0 {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientTCPForwarding(config.TCPForwarding, c); err != nil {
-				logrus.Fatal("failed to run TCP forwarding", zap.Error(err))
-			}
-		}()
-	}
-	if len(config.UDPForwarding) > 0 {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientUDPForwarding(config.UDPForwarding, c); err != nil {
-				logrus.Fatal("failed to run UDP forwarding", zap.Error(err))
-			}
-		}()
-	}
-	if config.TCPTProxy != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientTCPTProxy(*config.TCPTProxy, c); err != nil {
-				logrus.Fatal("failed to run TCP transparent proxy", zap.Error(err))
-			}
-		}()
-	}
-	if config.UDPTProxy != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientUDPTProxy(*config.UDPTProxy, c); err != nil {
-				logrus.Fatal("failed to run UDP transparent proxy", zap.Error(err))
-			}
-		}()
-	}
-
-	if !hasMode {
-		logrus.Fatal("no mode specified")
-	}
-	wg.Wait()
-}
-
-func runClient(cmd *cobra.Command, args []string) {
-	logger.Info("client mode")
-
-	if err := viper.ReadInConfig(); err != nil {
-		logger.Fatal("failed to read client config", zap.Error(err))
-	}
-	var config clientConfig
-	if err := viper.Unmarshal(&config); err != nil {
-		logger.Fatal("failed to parse client config", zap.Error(err))
-	}
-	hyConfig, err := config.Config()
-	if err != nil {
-		logger.Fatal("failed to load client config", zap.Error(err))
-	}
-
-	c, err := client.NewReconnectableClient(hyConfig, func(c client.Client, count int) {
-		connectLog(count)
-		// On the client side, we start checking for updates after we successfully connect
-		// to the server, which, depending on whether lazy mode is enabled, may or may not
-		// be immediately after the client starts. We don't want the update check request
-		// to interfere with the lazy mode option.
-		if count == 1 && !disableUpdateCheck {
-			go runCheckUpdateClient(c)
-		}
-	}, config.Lazy)
-	if err != nil {
-		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
 	defer c.Close()
 
@@ -615,6 +511,119 @@ func runClient(cmd *cobra.Command, args []string) {
 	wg.Wait()
 }
 
+func runClient(cmd *cobra.Command, args []string) {
+	logger.Info("client mode")
+
+	if err := viper.ReadInConfig(); err != nil {
+		logger.Fatal("failed to read client config", zap.Error(err))
+	}
+	var config clientConfig
+	if err := viper.Unmarshal(&config); err != nil {
+		logger.Fatal("failed to parse client config", zap.Error(err))
+	}
+	hyConfig, err := config.Config()
+	if err != nil {
+		logger.Fatal("failed to load client config", zap.Error(err))
+	}
+
+	c, err := client.NewReconnectableClient(hyConfig, func(c client.Client, count int) {
+		connectLog(count)
+		// On the client side, we start checking for updates after we successfully connect
+		// to the server, which, depending on whether lazy mode is enabled, may or may not
+		// be immediately after the client starts. We don't want the update check request
+		// to interfere with the lazy mode option.
+		if count == 1 && !disableUpdateCheck {
+			go runCheckUpdateClient(c)
+		}
+	}, config.Lazy)
+	if err != nil {
+		logger.Fatal("failed to initialize client", zap.Error(err))
+	}
+	defer c.Close()
+
+	uri := config.URI()
+	logger.Info("use this URI to share your server", zap.String("uri", uri))
+	if showQR {
+		utils.PrintQR(uri)
+	}
+
+	// Register modes
+	var runner clientModeRunner
+	if config.SOCKS5 != nil {
+		runner.Add("SOCKS5 server", func() error {
+			return clientSOCKS5(*config.SOCKS5, c)
+		})
+	}
+	if config.HTTP != nil {
+		runner.Add("HTTP proxy server", func() error {
+			return clientHTTP(*config.HTTP, c)
+		})
+	}
+	if len(config.TCPForwarding) > 0 {
+		runner.Add("TCP forwarding", func() error {
+			return clientTCPForwarding(config.TCPForwarding, c)
+		})
+	}
+	if len(config.UDPForwarding) > 0 {
+		runner.Add("UDP forwarding", func() error {
+			return clientUDPForwarding(config.UDPForwarding, c)
+		})
+	}
+	if config.TCPTProxy != nil {
+		runner.Add("TCP transparent proxy", func() error {
+			return clientTCPTProxy(*config.TCPTProxy, c)
+		})
+	}
+	if config.UDPTProxy != nil {
+		runner.Add("UDP transparent proxy", func() error {
+			return clientUDPTProxy(*config.UDPTProxy, c)
+		})
+	}
+	if config.TCPRedirect != nil {
+		runner.Add("TCP redirect", func() error {
+			return clientTCPRedirect(*config.TCPRedirect, c)
+		})
+	}
+
+	runner.Run()
+}
+
+type clientModeRunner struct {
+	ModeMap map[string]func() error
+}
+
+func (r *clientModeRunner) Add(name string, f func() error) {
+	if r.ModeMap == nil {
+		r.ModeMap = make(map[string]func() error)
+	}
+	r.ModeMap[name] = f
+}
+
+func (r *clientModeRunner) Run() {
+	if len(r.ModeMap) == 0 {
+		logger.Fatal("no mode specified")
+	}
+
+	type modeError struct {
+		Name string
+		Err  error
+	}
+	errChan := make(chan modeError, len(r.ModeMap))
+	for name, f := range r.ModeMap {
+		go func(name string, f func() error) {
+			err := f()
+			errChan <- modeError{name, err}
+		}(name, f)
+	}
+	// Fatal if any one of the modes fails
+	for i := 0; i < len(r.ModeMap); i++ {
+		e := <-errChan
+		if e.Err != nil {
+			logger.Fatal("failed to run "+e.Name, zap.Error(e.Err))
+		}
+	}
+}
+
 func clientSOCKS5(config socks5Config, c client.Client) error {
 	if config.Listen == "" {
 		return configError{Field: "listen", Err: errors.New("listen address is empty")}
@@ -636,7 +645,7 @@ func clientSOCKS5(config socks5Config, c client.Client) error {
 		DisableUDP:  config.DisableUDP,
 		EventLogger: &socks5Logger{},
 	}
-	logrus.Info("SOCKS5 server listening", zap.String("addr", config.Listen))
+	logger.Info("SOCKS5 server listening", zap.String("addr", config.Listen))
 	return s.Serve(l)
 }
 
@@ -664,7 +673,7 @@ func clientHTTP(config httpConfig, c client.Client) error {
 		AuthRealm:   config.Realm,
 		EventLogger: &httpLogger{},
 	}
-	logrus.Info("HTTP proxy server listening", zap.String("addr", config.Listen))
+	logger.Info("HTTP proxy server listening", zap.String("addr", config.Listen))
 	return h.Serve(l)
 }
 
@@ -681,7 +690,7 @@ func clientTCPForwarding(entries []tcpForwardingEntry, c client.Client) error {
 		if err != nil {
 			return configError{Field: "listen", Err: err}
 		}
-		logrus.Info("TCP forwarding listening", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
+		logger.Info("TCP forwarding listening", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
 		go func(remote string) {
 			t := &forwarding.TCPTunnel{
 				HyClient:    c,
@@ -708,7 +717,7 @@ func clientUDPForwarding(entries []udpForwardingEntry, c client.Client) error {
 		if err != nil {
 			return configError{Field: "listen", Err: err}
 		}
-		logrus.Info("UDP forwarding listening", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
+		logger.Info("UDP forwarding listening", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
 		go func(remote string, timeout time.Duration) {
 			u := &forwarding.UDPTunnel{
 				HyClient:    c,
@@ -735,7 +744,7 @@ func clientTCPTProxy(config tcpTProxyConfig, c client.Client) error {
 		HyClient:    c,
 		EventLogger: &tcpTProxyLogger{},
 	}
-	logrus.Info("TCP transparent proxy listening", zap.String("addr", config.Listen))
+	logger.Info("TCP transparent proxy listening", zap.String("addr", config.Listen))
 	return p.ListenAndServe(laddr)
 }
 
@@ -752,7 +761,23 @@ func clientUDPTProxy(config udpTProxyConfig, c client.Client) error {
 		Timeout:     config.Timeout,
 		EventLogger: &udpTProxyLogger{},
 	}
-	logrus.Info("UDP transparent proxy listening", zap.String("addr", config.Listen))
+	logger.Info("UDP transparent proxy listening", zap.String("addr", config.Listen))
+	return p.ListenAndServe(laddr)
+}
+
+func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
+	if config.Listen == "" {
+		return configError{Field: "listen", Err: errors.New("listen address is empty")}
+	}
+	laddr, err := net.ResolveTCPAddr("tcp", config.Listen)
+	if err != nil {
+		return configError{Field: "listen", Err: err}
+	}
+	p := &redirect.TCPRedirect{
+		HyClient:    c,
+		EventLogger: &tcpRedirectLogger{},
+	}
+	logger.Info("TCP redirect listening", zap.String("addr", config.Listen))
 	return p.ListenAndServe(laddr)
 }
 
@@ -799,113 +824,127 @@ func (f *adaptiveConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 }
 
 func connectLog(count int) {
-	logrus.Info("connected to server", zap.Int("count", count))
+	logger.Info("connected to server", zap.Int("count", count))
 }
 
 type socks5Logger struct{}
 
 func (l *socks5Logger) TCPRequest(addr net.Addr, reqAddr string) {
-	logrus.Debug("SOCKS5 TCP request", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
+	logger.Debug("SOCKS5 TCP request", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
 }
 
 func (l *socks5Logger) TCPError(addr net.Addr, reqAddr string, err error) {
 	if err == nil {
-		logrus.Debug("SOCKS5 TCP closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
+		logger.Debug("SOCKS5 TCP closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
 	} else {
-		logrus.Error("SOCKS5 TCP error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+		logger.Error("SOCKS5 TCP error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
 	}
 }
 
 func (l *socks5Logger) UDPRequest(addr net.Addr) {
-	logrus.Debug("SOCKS5 UDP request", zap.String("addr", addr.String()))
+	logger.Debug("SOCKS5 UDP request", zap.String("addr", addr.String()))
 }
 
 func (l *socks5Logger) UDPError(addr net.Addr, err error) {
 	if err == nil {
-		logrus.Debug("SOCKS5 UDP closed", zap.String("addr", addr.String()))
+		logger.Debug("SOCKS5 UDP closed", zap.String("addr", addr.String()))
 	} else {
-		logrus.Error("SOCKS5 UDP error", zap.String("addr", addr.String()), zap.Error(err))
+		logger.Error("SOCKS5 UDP error", zap.String("addr", addr.String()), zap.Error(err))
 	}
 }
 
 type httpLogger struct{}
 
 func (l *httpLogger) ConnectRequest(addr net.Addr, reqAddr string) {
-	logrus.Debug("HTTP CONNECT request", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
+	logger.Debug("HTTP CONNECT request", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
 }
 
 func (l *httpLogger) ConnectError(addr net.Addr, reqAddr string, err error) {
 	if err == nil {
-		logrus.Debug("HTTP CONNECT closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
+		logger.Debug("HTTP CONNECT closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
 	} else {
-		logrus.Error("HTTP CONNECT error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+		logger.Error("HTTP CONNECT error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
 	}
 }
 
 func (l *httpLogger) HTTPRequest(addr net.Addr, reqURL string) {
-	logrus.Debug("HTTP request", zap.String("addr", addr.String()), zap.String("reqURL", reqURL))
+	logger.Debug("HTTP request", zap.String("addr", addr.String()), zap.String("reqURL", reqURL))
 }
 
 func (l *httpLogger) HTTPError(addr net.Addr, reqURL string, err error) {
 	if err == nil {
-		logrus.Debug("HTTP closed", zap.String("addr", addr.String()), zap.String("reqURL", reqURL))
+		logger.Debug("HTTP closed", zap.String("addr", addr.String()), zap.String("reqURL", reqURL))
 	} else {
-		logrus.Error("HTTP error", zap.String("addr", addr.String()), zap.String("reqURL", reqURL), zap.Error(err))
+		logger.Error("HTTP error", zap.String("addr", addr.String()), zap.String("reqURL", reqURL), zap.Error(err))
 	}
 }
 
 type tcpLogger struct{}
 
 func (l *tcpLogger) Connect(addr net.Addr) {
-	logrus.Debug("TCP forwarding connect", zap.String("addr", addr.String()))
+	logger.Debug("TCP forwarding connect", zap.String("addr", addr.String()))
 }
 
 func (l *tcpLogger) Error(addr net.Addr, err error) {
 	if err == nil {
-		logrus.Debug("TCP forwarding closed", zap.String("addr", addr.String()))
+		logger.Debug("TCP forwarding closed", zap.String("addr", addr.String()))
 	} else {
-		logrus.Error("TCP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
+		logger.Error("TCP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
 	}
 }
 
 type udpLogger struct{}
 
 func (l *udpLogger) Connect(addr net.Addr) {
-	logrus.Debug("UDP forwarding connect", zap.String("addr", addr.String()))
+	logger.Debug("UDP forwarding connect", zap.String("addr", addr.String()))
 }
 
 func (l *udpLogger) Error(addr net.Addr, err error) {
 	if err == nil {
-		logrus.Debug("UDP forwarding closed", zap.String("addr", addr.String()))
+		logger.Debug("UDP forwarding closed", zap.String("addr", addr.String()))
 	} else {
-		logrus.Error("UDP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
+		logger.Error("UDP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
 	}
 }
 
 type tcpTProxyLogger struct{}
 
 func (l *tcpTProxyLogger) Connect(addr, reqAddr net.Addr) {
-	logrus.Debug("TCP transparent proxy connect", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
+	logger.Debug("TCP transparent proxy connect", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 }
 
 func (l *tcpTProxyLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
-		logrus.Debug("TCP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
+		logger.Debug("TCP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 	} else {
-		logrus.Error("TCP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		logger.Error("TCP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
 	}
 }
 
 type udpTProxyLogger struct{}
 
 func (l *udpTProxyLogger) Connect(addr, reqAddr net.Addr) {
-	logrus.Debug("UDP transparent proxy connect", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
+	logger.Debug("UDP transparent proxy connect", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 }
 
 func (l *udpTProxyLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
-		logrus.Debug("UDP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
+		logger.Debug("UDP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 	} else {
-		logrus.Error("UDP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		logger.Error("UDP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+	}
+}
+
+type tcpRedirectLogger struct{}
+
+func (l *tcpRedirectLogger) Connect(addr, reqAddr net.Addr) {
+	logger.Debug("TCP redirect connect", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
+}
+
+func (l *tcpRedirectLogger) Error(addr, reqAddr net.Addr, err error) {
+	if err == nil {
+		logger.Debug("TCP redirect closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
+	} else {
+		logger.Error("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
 	}
 }

@@ -18,12 +18,13 @@ const (
 ░█▀█░░█░░▀▀█░░█░░█▀▀░█▀▄░░█░░█▀█░░░▄▀░
 ░▀░▀░░▀░░▀▀▀░░▀░░▀▀▀░▀░▀░▀▀▀░▀░▀░░░▀▀▀
 `
-	appDesc    = "a powerful, censorship-resistant proxy tool optimized for lossy networks"
+	appDesc    = "a powerful, lightning fast and censorship resistant proxy"
 	appAuthors = "Aperture Internet Laboratory <https://github.com/apernet>"
 
 	appLogLevelEnv           = "HYSTERIA_LOG_LEVEL"
 	appLogFormatEnv          = "HYSTERIA_LOG_FORMAT"
 	appDisableUpdateCheckEnv = "HYSTERIA_DISABLE_UPDATE_CHECK"
+	appACMEDirEnv            = "HYSTERIA_ACME_DIR"
 )
 
 var (
@@ -77,7 +78,7 @@ var logFormatMap = map[string]zapcore.EncoderConfig{
 		NameKey:        "logger",
 		MessageKey:     "msg",
 		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.CapitalColorLevelEncoder,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,
 		EncodeTime:     zapcore.RFC3339TimeEncoder,
 		EncodeDuration: zapcore.SecondsDurationEncoder,
 	},
@@ -102,13 +103,13 @@ func Execute() {
 
 func init() {
 	initFlags()
-	cobra.OnInitialize(initConfig)
-	cobra.OnInitialize(initLogger) // initLogger must come after initConfig as it depends on config
+	// cobra.OnInitialize(initConfig)
+	// cobra.OnInitialize(initLogger) // initLogger must come after initConfig as it depends on config
 }
 
 func initFlags() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file")
-	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", envOrDefaultString(appLogLevelEnv, "info"), "log level")
+	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", envOrDefaultString(appLogLevelEnv, "debug"), "log level")
 	rootCmd.PersistentFlags().StringVarP(&logFormat, "log-format", "f", envOrDefaultString(appLogFormatEnv, "console"), "log format")
 	rootCmd.PersistentFlags().BoolVar(&disableUpdateCheck, "disable-update-check", envOrDefaultBool(appDisableUpdateCheckEnv, false), "disable update check")
 }
@@ -119,9 +120,10 @@ func initConfig() {
 	} else {
 		viper.SetConfigName("config")
 		viper.SetConfigType("yaml")
-		viper.AddConfigPath("/etc/hysteria/")
-		viper.AddConfigPath("$HOME/.hysteria")
+		viper.SupportedExts = append([]string{"yaml", "yml"}, viper.SupportedExts...)
 		viper.AddConfigPath(".")
+		viper.AddConfigPath("$HOME/.hysteria")
+		viper.AddConfigPath("/etc/hysteria/")
 	}
 }
 
@@ -151,6 +153,10 @@ func initLogger() {
 		fmt.Printf("failed to initialize logger: %s\n", err)
 		os.Exit(1)
 	}
+}
+
+func InitLogger() {
+	initLogger()
 }
 
 func envOrDefaultString(key, def string) string {

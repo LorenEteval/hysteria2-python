@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Go
         uses: actions/setup-go@v4
@@ -26,9 +26,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25b
+          add-to-path: false
+          local-cache: true
+
       - name: Run build script
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          pip install requests
           export HY_APP_PLATFORMS=$(sed 's/\r$//' platforms.txt | awk '!/^#/ && !/^$/' | paste -sd ",")
           python hyperbole.py build -r
 
@@ -46,4 +54,5 @@ jobs:
       - name: Publish to API
         run: |
           export HY_API_POST_KEY=${{ secrets.HY2_API_POST_KEY }}
+          pip install requests
           python hyperbole.py publish
