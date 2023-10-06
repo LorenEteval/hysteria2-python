@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -440,75 +439,45 @@ func StartFromJSON(json string) {
 		utils.PrintQR(uri)
 	}
 
-	// Modes
-	var wg sync.WaitGroup
-	hasMode := false
-
+	// Register modes
+	var runner clientModeRunner
 	if config.SOCKS5 != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientSOCKS5(*config.SOCKS5, c); err != nil {
-				logger.Fatal("failed to run SOCKS5 server", zap.Error(err))
-			}
-		}()
+		runner.Add("SOCKS5 server", func() error {
+			return clientSOCKS5(*config.SOCKS5, c)
+		})
 	}
 	if config.HTTP != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientHTTP(*config.HTTP, c); err != nil {
-				logger.Fatal("failed to run HTTP proxy server", zap.Error(err))
-			}
-		}()
+		runner.Add("HTTP proxy server", func() error {
+			return clientHTTP(*config.HTTP, c)
+		})
 	}
 	if len(config.TCPForwarding) > 0 {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientTCPForwarding(config.TCPForwarding, c); err != nil {
-				logger.Fatal("failed to run TCP forwarding", zap.Error(err))
-			}
-		}()
+		runner.Add("TCP forwarding", func() error {
+			return clientTCPForwarding(config.TCPForwarding, c)
+		})
 	}
 	if len(config.UDPForwarding) > 0 {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientUDPForwarding(config.UDPForwarding, c); err != nil {
-				logger.Fatal("failed to run UDP forwarding", zap.Error(err))
-			}
-		}()
+		runner.Add("UDP forwarding", func() error {
+			return clientUDPForwarding(config.UDPForwarding, c)
+		})
 	}
 	if config.TCPTProxy != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientTCPTProxy(*config.TCPTProxy, c); err != nil {
-				logger.Fatal("failed to run TCP transparent proxy", zap.Error(err))
-			}
-		}()
+		runner.Add("TCP transparent proxy", func() error {
+			return clientTCPTProxy(*config.TCPTProxy, c)
+		})
 	}
 	if config.UDPTProxy != nil {
-		hasMode = true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := clientUDPTProxy(*config.UDPTProxy, c); err != nil {
-				logger.Fatal("failed to run UDP transparent proxy", zap.Error(err))
-			}
-		}()
+		runner.Add("UDP transparent proxy", func() error {
+			return clientUDPTProxy(*config.UDPTProxy, c)
+		})
+	}
+	if config.TCPRedirect != nil {
+		runner.Add("TCP redirect", func() error {
+			return clientTCPRedirect(*config.TCPRedirect, c)
+		})
 	}
 
-	if !hasMode {
-		logger.Fatal("no mode specified")
-	}
-	wg.Wait()
+	runner.Run()
 }
 
 func runClient(cmd *cobra.Command, args []string) {
