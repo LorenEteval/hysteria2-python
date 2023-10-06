@@ -14,7 +14,13 @@ namespace {
     {
         GoString jsonString{json.data(), static_cast<ptrdiff_t>(json.size())};
 
-        startClientFromJSON(jsonString);
+        {
+            py::gil_scoped_release release;
+
+            startClientFromJSON(jsonString);
+
+            py::gil_scoped_acquire acquire;
+        }
     }
 
     PYBIND11_MODULE(hysteria2, m) {
