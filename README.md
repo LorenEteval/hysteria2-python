@@ -32,6 +32,9 @@ To use this binding, please first make sure that:
 
 You have to install the following tools to be able to install this package successfully.
 
+> Note: hysteria2 v2.0.3+ requires at least go 1.21, which means hysteria2-python will also
+> need go 1.21+ to be able to build and install successfully since v2.0.3.
+
 * [go](https://go.dev/doc/install) in your PATH. go 1.20.0 and above is recommended. To check go is ready,
   type `go version`. Also, if google service is blocked in your region(such as Mainland China), you have to configure
   your GOPROXY to be able to pull go packages. For Chinese users, refer to [goproxy.cn](https://goproxy.cn/) for more
