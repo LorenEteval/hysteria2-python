@@ -1,6 +1,9 @@
 package brutal
 
 import (
+	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/apernet/hysteria/core/internal/congestion/common"
@@ -9,9 +12,12 @@ import (
 )
 
 const (
-	pktInfoSlotCount = 4
+	pktInfoSlotCount = 5 // slot index is based on seconds, so this is basically how many seconds we sample
 	minSampleCount   = 50
 	minAckRate       = 0.8
+
+	debugEnv           = "HYSTERIA_BRUTAL_DEBUG"
+	debugPrintInterval = 2
 )
 
 var _ congestion.CongestionControl = &BrutalSender{}
@@ -24,6 +30,9 @@ type BrutalSender struct {
 
 	pktInfoSlots [pktInfoSlotCount]pktInfo
 	ackRate      float64
+
+	debug                 bool
+	lastAckPrintTimestamp int64
 }
 
 type pktInfo struct {
@@ -33,10 +42,12 @@ type pktInfo struct {
 }
 
 func NewBrutalSender(bps uint64) *BrutalSender {
+	debug, _ := strconv.ParseBool(os.Getenv(debugEnv))
 	bs := &BrutalSender{
 		bps:             congestion.ByteCount(bps),
 		maxDatagramSize: congestion.InitialPacketSizeIPv4,
 		ackRate:         1,
+		debug:           debug,
 	}
 	bs.pacer = common.NewPacer(func() congestion.ByteCount {
 		return congestion.ByteCount(float64(bs.bps) / bs.ackRate)
@@ -77,42 +88,36 @@ func (b *BrutalSender) OnPacketSent(sentTime time.Time, bytesInFlight congestion
 func (b *BrutalSender) OnPacketAcked(number congestion.PacketNumber, ackedBytes congestion.ByteCount,
 	priorInFlight congestion.ByteCount, eventTime time.Time,
 ) {
-	currentTimestamp := eventTime.Unix()
-	slot := currentTimestamp % pktInfoSlotCount
-	if b.pktInfoSlots[slot].Timestamp == currentTimestamp {
-		b.pktInfoSlots[slot].AckCount++
-	} else {
-		// uninitialized slot or too old, reset
-		b.pktInfoSlots[slot].Timestamp = currentTimestamp
-		b.pktInfoSlots[slot].AckCount = 1
-		b.pktInfoSlots[slot].LossCount = 0
-	}
-	b.updateAckRate(currentTimestamp)
+	// Stub
 }
 
 func (b *BrutalSender) OnCongestionEvent(number congestion.PacketNumber, lostBytes congestion.ByteCount,
 	priorInFlight congestion.ByteCount,
 ) {
-	currentTimestamp := time.Now().Unix()
-	slot := currentTimestamp % pktInfoSlotCount
-	if b.pktInfoSlots[slot].Timestamp == currentTimestamp {
-		b.pktInfoSlots[slot].LossCount++
-	} else {
-		// uninitialized slot or too old, reset
-		b.pktInfoSlots[slot].Timestamp = currentTimestamp
-		b.pktInfoSlots[slot].AckCount = 0
-		b.pktInfoSlots[slot].LossCount = 1
-	}
-	b.updateAckRate(currentTimestamp)
+	// Stub
 }
 
 func (b *BrutalSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, eventTime time.Time, ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo) {
-	// Stub
+	currentTimestamp := eventTime.Unix()
+	slot := currentTimestamp % pktInfoSlotCount
+	if b.pktInfoSlots[slot].Timestamp == currentTimestamp {
+		b.pktInfoSlots[slot].LossCount += uint64(len(lostPackets))
+		b.pktInfoSlots[slot].AckCount += uint64(len(ackedPackets))
+	} else {
+		// uninitialized slot or too old, reset
+		b.pktInfoSlots[slot].Timestamp = currentTimestamp
+		b.pktInfoSlots[slot].AckCount = uint64(len(ackedPackets))
+		b.pktInfoSlots[slot].LossCount = uint64(len(lostPackets))
+	}
+	b.updateAckRate(currentTimestamp)
 }
 
 func (b *BrutalSender) SetMaxDatagramSize(size congestion.ByteCount) {
 	b.maxDatagramSize = size
 	b.pacer.SetMaxDatagramSize(size)
+	if b.debug {
+		b.debugPrint("SetMaxDatagramSize: %d", size)
+	}
 }
 
 func (b *BrutalSender) updateAckRate(currentTimestamp int64) {
@@ -127,12 +132,29 @@ func (b *BrutalSender) updateAckRate(currentTimestamp int64) {
 	}
 	if ackCount+lossCount < minSampleCount {
 		b.ackRate = 1
+		if b.canPrintAckRate(currentTimestamp) {
+			b.lastAckPrintTimestamp = currentTimestamp
+			b.debugPrint("Not enough samples (total=%d, ack=%d, loss=%d, rtt=%d)",
+				ackCount+lossCount, ackCount, lossCount, b.rttStats.SmoothedRTT().Milliseconds())
+		}
+		return
 	}
 	rate := float64(ackCount) / float64(ackCount+lossCount)
 	if rate < minAckRate {
 		b.ackRate = minAckRate
+		if b.canPrintAckRate(currentTimestamp) {
+			b.lastAckPrintTimestamp = currentTimestamp
+			b.debugPrint("ACK rate too low: %.2f, clamped to %.2f (total=%d, ack=%d, loss=%d, rtt=%d)",
+				rate, minAckRate, ackCount+lossCount, ackCount, lossCount, b.rttStats.SmoothedRTT().Milliseconds())
+		}
+		return
 	}
 	b.ackRate = rate
+	if b.canPrintAckRate(currentTimestamp) {
+		b.lastAckPrintTimestamp = currentTimestamp
+		b.debugPrint("ACK rate: %.2f (total=%d, ack=%d, loss=%d, rtt=%d)",
+			rate, ackCount+lossCount, ackCount, lossCount, b.rttStats.SmoothedRTT().Milliseconds())
+	}
 }
 
 func (b *BrutalSender) InSlowStart() bool {
@@ -146,3 +168,13 @@ func (b *BrutalSender) InRecovery() bool {
 func (b *BrutalSender) MaybeExitSlowStart() {}
 
 func (b *BrutalSender) OnRetransmissionTimeout(packetsRetransmitted bool) {}
+
+func (b *BrutalSender) canPrintAckRate(currentTimestamp int64) bool {
+	return b.debug && currentTimestamp-b.lastAckPrintTimestamp >= debugPrintInterval
+}
+
+func (b *BrutalSender) debugPrint(format string, a ...any) {
+	fmt.Printf("[BrutalSender] [%s] %s\n",
+		time.Now().Format("15:04:05"),
+		fmt.Sprintf(format, a...))
+}
