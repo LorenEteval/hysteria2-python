@@ -14,7 +14,7 @@ CMAKE_BUILD_CACHE = 'CMakeBuildCache'
 
 
 def getHysteriaVersion():
-    return '2.0.3.1'
+    return '2.0.4'
 
 
 def runCommand(command):

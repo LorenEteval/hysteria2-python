@@ -29,6 +29,6 @@ namespace {
             "Start Hysteria2 client with JSON",
             py::arg("json"));
 
-        m.attr("__version__") = "2.0.3.1";
+        m.attr("__version__") = "2.0.4";
     }
 }
