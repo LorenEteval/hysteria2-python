@@ -123,6 +123,14 @@ func TestServerConfig(t *testing.T) {
 					Password: "Elliot Alderson",
 				},
 			},
+			{
+				Name: "weirdstuff",
+				Type: "http",
+				HTTP: serverConfigOutboundHTTP{
+					URL:      "https://eyy.lmao:4443/goofy",
+					Insecure: true,
+				},
+			},
 		},
 		TrafficStats: serverConfigTrafficStats{
 			Listen: ":9999",
@@ -135,6 +143,14 @@ func TestServerConfig(t *testing.T) {
 			Proxy: serverConfigMasqueradeProxy{
 				URL:         "https://some.site.net",
 				RewriteHost: true,
+			},
+			String: serverConfigMasqueradeString{
+				Content: "aint nothin here",
+				Headers: map[string]string{
+					"content-type": "text/plain",
+					"custom-haha":  "lol",
+				},
+				StatusCode: 418,
 			},
 			ListenHTTP:  ":80",
 			ListenHTTPS: ":443",

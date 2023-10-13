@@ -161,11 +161,17 @@ type serverConfigOutboundSOCKS5 struct {
 	Password string `mapstructure:"password"`
 }
 
+type serverConfigOutboundHTTP struct {
+	URL      string `mapstructure:"url"`
+	Insecure bool   `mapstructure:"insecure"`
+}
+
 type serverConfigOutboundEntry struct {
 	Name   string                     `mapstructure:"name"`
 	Type   string                     `mapstructure:"type"`
 	Direct serverConfigOutboundDirect `mapstructure:"direct"`
 	SOCKS5 serverConfigOutboundSOCKS5 `mapstructure:"socks5"`
+	HTTP   serverConfigOutboundHTTP   `mapstructure:"http"`
 }
 
 type serverConfigTrafficStats struct {
@@ -181,13 +187,20 @@ type serverConfigMasqueradeProxy struct {
 	RewriteHost bool   `mapstructure:"rewriteHost"`
 }
 
+type serverConfigMasqueradeString struct {
+	Content    string            `mapstructure:"content"`
+	Headers    map[string]string `mapstructure:"headers"`
+	StatusCode int               `mapstructure:"statusCode"`
+}
+
 type serverConfigMasquerade struct {
-	Type        string                      `mapstructure:"type"`
-	File        serverConfigMasqueradeFile  `mapstructure:"file"`
-	Proxy       serverConfigMasqueradeProxy `mapstructure:"proxy"`
-	ListenHTTP  string                      `mapstructure:"listenHTTP"`
-	ListenHTTPS string                      `mapstructure:"listenHTTPS"`
-	ForceHTTPS  bool                        `mapstructure:"forceHTTPS"`
+	Type        string                       `mapstructure:"type"`
+	File        serverConfigMasqueradeFile   `mapstructure:"file"`
+	Proxy       serverConfigMasqueradeProxy  `mapstructure:"proxy"`
+	String      serverConfigMasqueradeString `mapstructure:"string"`
+	ListenHTTP  string                       `mapstructure:"listenHTTP"`
+	ListenHTTPS string                       `mapstructure:"listenHTTPS"`
+	ForceHTTPS  bool                         `mapstructure:"forceHTTPS"`
 }
 
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
@@ -395,6 +408,13 @@ func serverConfigOutboundSOCKS5ToOutbound(c serverConfigOutboundSOCKS5) (outboun
 	return outbounds.NewSOCKS5Outbound(c.Addr, c.Username, c.Password), nil
 }
 
+func serverConfigOutboundHTTPToOutbound(c serverConfigOutboundHTTP) (outbounds.PluggableOutbound, error) {
+	if c.URL == "" {
+		return nil, configError{Field: "outbounds.http.url", Err: errors.New("empty http address")}
+	}
+	return outbounds.NewHTTPOutbound(c.URL, c.Insecure)
+}
+
 func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 	// Resolver, ACL, actual outbound are all implemented through the Outbound interface.
 	// Depending on the config, we build a chain like this:
@@ -421,6 +441,8 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 				ob, err = serverConfigOutboundDirectToOutbound(entry.Direct)
 			case "socks5":
 				ob, err = serverConfigOutboundSOCKS5ToOutbound(entry.SOCKS5)
+			case "http":
+				ob, err = serverConfigOutboundHTTPToOutbound(entry.HTTP)
 			default:
 				err = configError{Field: "outbounds.type", Err: errors.New("unsupported outbound type")}
 			}
@@ -613,6 +635,28 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 				w.WriteHeader(http.StatusBadGateway)
 			},
 		}
+	case "string":
+		if c.Masquerade.String.Content == "" {
+			return configError{Field: "masquerade.string.content", Err: errors.New("empty string content")}
+		}
+		if c.Masquerade.String.StatusCode != 0 &&
+			(c.Masquerade.String.StatusCode < 200 ||
+				c.Masquerade.String.StatusCode > 599 ||
+				c.Masquerade.String.StatusCode == 233) {
+			// 233 is reserved for Hysteria authentication
+			return configError{Field: "masquerade.string.statusCode", Err: errors.New("invalid status code (must be 200-599, except 233)")}
+		}
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for k, v := range c.Masquerade.String.Headers {
+				w.Header().Set(k, v)
+			}
+			if c.Masquerade.String.StatusCode != 0 {
+				w.WriteHeader(c.Masquerade.String.StatusCode)
+			} else {
+				w.WriteHeader(http.StatusOK) // Use 200 OK by default
+			}
+			_, _ = w.Write([]byte(c.Masquerade.String.Content))
+		})
 	default:
 		return configError{Field: "masquerade.type", Err: errors.New("unsupported masquerade type")}
 	}
