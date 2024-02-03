@@ -10,23 +10,21 @@ import (
 // reconnectableClientImpl is a wrapper of Client, which can reconnect when the connection is closed,
 // except when the caller explicitly calls Close() to permanently close this client.
 type reconnectableClientImpl struct {
-	config        *Config
+	configFunc    func() (*Config, error)           // called before connecting
+	connectedFunc func(Client, *HandshakeInfo, int) // called when successfully connected
 	client        Client
 	count         int
-	connectedFunc func(Client, int) // called when successfully connected
 	m             sync.Mutex
 	closed        bool // permanent close
 }
 
-func NewReconnectableClient(config *Config, connectedFunc func(Client, int), lazy bool) (Client, error) {
-	// Make sure we capture any error in config and return it here,
-	// so that the caller doesn't have to wait until the first call
-	// to TCP() or UDP() to get the error (when lazy is true).
-	if err := config.verifyAndFill(); err != nil {
-		return nil, err
-	}
+// NewReconnectableClient creates a reconnectable client.
+// If lazy is true, the client will not connect until the first call to TCP() or UDP().
+// We use a function for config mainly to delay config evaluation
+// (which involves DNS resolution) until the actual connection attempt.
+func NewReconnectableClient(configFunc func() (*Config, error), connectedFunc func(Client, *HandshakeInfo, int), lazy bool) (Client, error) {
 	rc := &reconnectableClientImpl{
-		config:        config,
+		configFunc:    configFunc,
 		connectedFunc: connectedFunc,
 	}
 	if !lazy {
@@ -41,66 +39,73 @@ func (rc *reconnectableClientImpl) reconnect() error {
 	if rc.client != nil {
 		_ = rc.client.Close()
 	}
-	var err error
-	rc.client, err = NewClient(rc.config)
+	var info *HandshakeInfo
+	config, err := rc.configFunc()
+	if err != nil {
+		return err
+	}
+	rc.client, info, err = NewClient(config)
 	if err != nil {
 		return err
 	} else {
 		rc.count++
 		if rc.connectedFunc != nil {
-			rc.connectedFunc(rc, rc.count)
+			rc.connectedFunc(rc, info, rc.count)
 		}
 		return nil
 	}
 }
 
-func (rc *reconnectableClientImpl) TCP(addr string) (net.Conn, error) {
+// clientDo calls f with the current client.
+// If the client is nil, it will first reconnect.
+// It will also detect if the client is closed, and if so,
+// set it to nil for reconnect next time.
+func (rc *reconnectableClientImpl) clientDo(f func(Client) (interface{}, error)) (interface{}, error) {
 	rc.m.Lock()
-	defer rc.m.Unlock()
 	if rc.closed {
+		rc.m.Unlock()
 		return nil, coreErrs.ClosedError{}
 	}
 	if rc.client == nil {
 		// No active connection, connect first
 		if err := rc.reconnect(); err != nil {
+			rc.m.Unlock()
 			return nil, err
 		}
 	}
-	conn, err := rc.client.TCP(addr)
+	client := rc.client
+	rc.m.Unlock()
+
+	ret, err := f(client)
 	if _, ok := err.(coreErrs.ClosedError); ok {
-		// Connection closed, reconnect
-		if err := rc.reconnect(); err != nil {
-			return nil, err
+		// Connection closed, set client to nil for reconnect next time
+		rc.m.Lock()
+		if rc.client == client {
+			// This check is in case the client is already changed by another goroutine
+			rc.client = nil
 		}
-		return rc.client.TCP(addr)
+		rc.m.Unlock()
+	}
+	return ret, err
+}
+
+func (rc *reconnectableClientImpl) TCP(addr string) (net.Conn, error) {
+	if c, err := rc.clientDo(func(client Client) (interface{}, error) {
+		return client.TCP(addr)
+	}); err != nil {
+		return nil, err
 	} else {
-		// OK or some other temporary error
-		return conn, err
+		return c.(net.Conn), nil
 	}
 }
 
 func (rc *reconnectableClientImpl) UDP() (HyUDPConn, error) {
-	rc.m.Lock()
-	defer rc.m.Unlock()
-	if rc.closed {
-		return nil, coreErrs.ClosedError{}
-	}
-	if rc.client == nil {
-		// No active connection, connect first
-		if err := rc.reconnect(); err != nil {
-			return nil, err
-		}
-	}
-	conn, err := rc.client.UDP()
-	if _, ok := err.(coreErrs.ClosedError); ok {
-		// Connection closed, reconnect
-		if err := rc.reconnect(); err != nil {
-			return nil, err
-		}
-		return rc.client.UDP()
+	if c, err := rc.clientDo(func(client Client) (interface{}, error) {
+		return client.UDP()
+	}); err != nil {
+		return nil, err
 	} else {
-		// OK or some other temporary error
-		return conn, err
+		return c.(HyUDPConn), nil
 	}
 }
 

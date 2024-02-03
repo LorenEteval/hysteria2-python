@@ -2,8 +2,15 @@ package acl
 
 import (
 	"net"
+	"strings"
 
-	"github.com/oschwald/geoip2-golang"
+	"golang.org/x/net/idna"
+)
+
+const (
+	domainMatchExact = uint8(iota)
+	domainMatchWildcard
+	domainMatchSuffix
 )
 
 type hostMatcher interface {
@@ -27,15 +34,25 @@ func (m *cidrMatcher) Match(host HostInfo) bool {
 }
 
 type domainMatcher struct {
-	Pattern  string
-	Wildcard bool
+	Pattern string
+	Mode    uint8
 }
 
 func (m *domainMatcher) Match(host HostInfo) bool {
-	if m.Wildcard {
-		return deepMatchRune([]rune(host.Name), []rune(m.Pattern))
+	name, err := idna.ToUnicode(host.Name)
+	if err != nil {
+		name = host.Name
 	}
-	return m.Pattern == host.Name
+	switch m.Mode {
+	case domainMatchExact:
+		return name == m.Pattern
+	case domainMatchWildcard:
+		return deepMatchRune([]rune(name), []rune(m.Pattern))
+	case domainMatchSuffix:
+		return name == m.Pattern || strings.HasSuffix(name, "."+m.Pattern)
+	default:
+		return false // Invalid mode
+	}
 }
 
 func deepMatchRune(str, pattern []rune) bool {
@@ -53,27 +70,6 @@ func deepMatchRune(str, pattern []rune) bool {
 		pattern = pattern[1:]
 	}
 	return len(str) == 0 && len(pattern) == 0
-}
-
-type geoipMatcher struct {
-	DB      *geoip2.Reader
-	Country string // must be uppercase ISO 3166-1 alpha-2 code
-}
-
-func (m *geoipMatcher) Match(host HostInfo) bool {
-	if host.IPv4 != nil {
-		record, err := m.DB.Country(host.IPv4)
-		if err == nil && record.Country.IsoCode == m.Country {
-			return true
-		}
-	}
-	if host.IPv6 != nil {
-		record, err := m.DB.Country(host.IPv6)
-		if err == nil && record.Country.IsoCode == m.Country {
-			return true
-		}
-	}
-	return false
 }
 
 type allMatcher struct{}

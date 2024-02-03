@@ -1,9 +1,13 @@
 package masq
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
+
+	"github.com/apernet/hysteria/extras/correctnet"
 )
 
 // MasqTCPServer covers the TCP parts of a standard web server (TCP based HTTP/HTTPS).
@@ -18,7 +22,7 @@ type MasqTCPServer struct {
 }
 
 func (s *MasqTCPServer) ListenAndServeHTTP(addr string) error {
-	return http.ListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return correctnet.HTTPListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.ForceHTTPS {
 			if s.HTTPSPort == 0 || s.HTTPSPort == 443 {
 				// Omit port if it's the default
@@ -28,10 +32,7 @@ func (s *MasqTCPServer) ListenAndServeHTTP(addr string) error {
 			}
 			return
 		}
-		s.Handler.ServeHTTP(&altSvcHijackResponseWriter{
-			Port:           s.QUICPort,
-			ResponseWriter: w,
-		}, r)
+		s.Handler.ServeHTTP(newAltSvcHijackResponseWriter(w, s.QUICPort), r)
 	}))
 }
 
@@ -39,15 +40,19 @@ func (s *MasqTCPServer) ListenAndServeHTTPS(addr string) error {
 	server := &http.Server{
 		Addr: addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			s.Handler.ServeHTTP(&altSvcHijackResponseWriter{
-				Port:           s.QUICPort,
-				ResponseWriter: w,
-			}, r)
+			s.Handler.ServeHTTP(newAltSvcHijackResponseWriter(w, s.QUICPort), r)
 		}),
 		TLSConfig: s.TLSConfig,
 	}
-	return server.ListenAndServeTLS("", "")
+	listener, err := correctnet.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	return server.ServeTLS(listener, "", "")
 }
+
+var _ http.ResponseWriter = (*altSvcHijackResponseWriter)(nil)
 
 // altSvcHijackResponseWriter makes sure that the Alt-Svc's port
 // is always set with our own value, no matter what the handler sets.
@@ -59,4 +64,31 @@ type altSvcHijackResponseWriter struct {
 func (w *altSvcHijackResponseWriter) WriteHeader(statusCode int) {
 	w.Header().Set("Alt-Svc", fmt.Sprintf(`h3=":%d"; ma=2592000`, w.Port))
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+var _ http.Hijacker = (*altSvcHijackResponseWriterHijacker)(nil)
+
+// altSvcHijackResponseWriterHijacker is a wrapper around altSvcHijackResponseWriter
+// that also implements http.Hijacker. This is needed for WebSocket support.
+type altSvcHijackResponseWriterHijacker struct {
+	altSvcHijackResponseWriter
+}
+
+func (w *altSvcHijackResponseWriterHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.ResponseWriter.(http.Hijacker).Hijack()
+}
+
+func newAltSvcHijackResponseWriter(w http.ResponseWriter, port int) http.ResponseWriter {
+	if _, ok := w.(http.Hijacker); ok {
+		return &altSvcHijackResponseWriterHijacker{
+			altSvcHijackResponseWriter: altSvcHijackResponseWriter{
+				Port:           port,
+				ResponseWriter: w,
+			},
+		}
+	}
+	return &altSvcHijackResponseWriter{
+		Port:           port,
+		ResponseWriter: w,
+	}
 }

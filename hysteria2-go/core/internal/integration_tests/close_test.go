@@ -34,7 +34,7 @@ func TestClientServerTCPClose(t *testing.T) {
 	go s.Serve()
 
 	// Create client
-	c, err := client.NewClient(&client.Config{
+	c, _, err := client.NewClient(&client.Config{
 		ServerAddr: udpAddr,
 		TLSConfig:  client.TLSConfig{InsecureSkipVerify: true},
 	})
@@ -116,7 +116,7 @@ func TestClientServerUDPIdleTimeout(t *testing.T) {
 	go s.Serve()
 
 	// Create client
-	c, err := client.NewClient(&client.Config{
+	c, _, err := client.NewClient(&client.Config{
 		ServerAddr: udpAddr,
 		TLSConfig:  client.TLSConfig{InsecureSkipVerify: true},
 	})
@@ -194,7 +194,7 @@ func TestClientServerClientShutdown(t *testing.T) {
 	go s.Serve()
 
 	// Create client
-	c, err := client.NewClient(&client.Config{
+	c, _, err := client.NewClient(&client.Config{
 		ServerAddr: udpAddr,
 		TLSConfig:  client.TLSConfig{InsecureSkipVerify: true},
 	})
@@ -223,19 +223,23 @@ func TestClientServerServerShutdown(t *testing.T) {
 	go s.Serve()
 
 	// Create client
-	c, err := client.NewClient(&client.Config{
+	c, _, err := client.NewClient(&client.Config{
 		ServerAddr: udpAddr,
 		TLSConfig:  client.TLSConfig{InsecureSkipVerify: true},
+		QUICConfig: client.QUICConfig{
+			MaxIdleTimeout: 4 * time.Second,
+		},
 	})
 	assert.NoError(t, err)
 
 	// Close the server - expect the client to return ClosedError for both TCP & UDP calls.
 	_ = s.Close()
-	time.Sleep(1 * time.Second)
 
 	_, err = c.TCP("whatever")
 	_, ok := err.(errors.ClosedError)
 	assert.True(t, ok)
+
+	time.Sleep(1 * time.Second) // Allow some time for the error to be propagated to the UDP session manager
 
 	_, err = c.UDP()
 	_, ok = err.(errors.ClosedError)

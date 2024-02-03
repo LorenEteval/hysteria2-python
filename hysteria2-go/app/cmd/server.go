@@ -23,10 +23,15 @@ import (
 	"github.com/apernet/hysteria/app/internal/utils"
 	"github.com/apernet/hysteria/core/server"
 	"github.com/apernet/hysteria/extras/auth"
+	"github.com/apernet/hysteria/extras/correctnet"
 	"github.com/apernet/hysteria/extras/masq"
 	"github.com/apernet/hysteria/extras/obfs"
 	"github.com/apernet/hysteria/extras/outbounds"
 	"github.com/apernet/hysteria/extras/trafficlogger"
+)
+
+const (
+	defaultListenAddr = ":443"
 )
 
 var serverCmd = &cobra.Command{
@@ -143,9 +148,11 @@ type serverConfigResolver struct {
 }
 
 type serverConfigACL struct {
-	File   string   `mapstructure:"file"`
-	Inline []string `mapstructure:"inline"`
-	GeoIP  string   `mapstructure:"geoip"`
+	File              string        `mapstructure:"file"`
+	Inline            []string      `mapstructure:"inline"`
+	GeoIP             string        `mapstructure:"geoip"`
+	GeoSite           string        `mapstructure:"geosite"`
+	GeoUpdateInterval time.Duration `mapstructure:"geoUpdateInterval"`
 }
 
 type serverConfigOutboundDirect struct {
@@ -176,6 +183,7 @@ type serverConfigOutboundEntry struct {
 
 type serverConfigTrafficStats struct {
 	Listen string `mapstructure:"listen"`
+	Secret string `mapstructure:"secret"`
 }
 
 type serverConfigMasqueradeFile struct {
@@ -206,13 +214,13 @@ type serverConfigMasquerade struct {
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
 	listenAddr := c.Listen
 	if listenAddr == "" {
-		listenAddr = ":443"
+		listenAddr = defaultListenAddr
 	}
 	uAddr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return configError{Field: "listen", Err: err}
 	}
-	conn, err := net.ListenUDP("udp", uAddr)
+	conn, err := correctnet.ListenUDP("udp", uAddr)
 	if err != nil {
 		return configError{Field: "listen", Err: err}
 	}
@@ -244,11 +252,12 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 		if c.TLS.Cert == "" || c.TLS.Key == "" {
 			return configError{Field: "tls", Err: errors.New("empty cert or key path")}
 		}
-		cert, err := tls.LoadX509KeyPair(c.TLS.Cert, c.TLS.Key)
-		if err != nil {
-			return configError{Field: "tls", Err: err}
+		// Use GetCertificate instead of Certificates so that
+		// users can update the cert without restarting the server.
+		hyConfig.TLSConfig.GetCertificate = func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert, err := tls.LoadX509KeyPair(c.TLS.Cert, c.TLS.Key)
+			return &cert, err
 		}
-		hyConfig.TLSConfig.Certificates = []tls.Certificate{cert}
 	} else {
 		// ACME
 		dataDir := c.ACME.Dir
@@ -460,21 +469,23 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 	if c.ACL.File != "" && len(c.ACL.Inline) > 0 {
 		return configError{Field: "acl", Err: errors.New("cannot set both acl.file and acl.inline")}
 	}
-	gLoader := &utils.GeoIPLoader{
-		Filename:        c.ACL.GeoIP,
-		DownloadFunc:    geoipDownloadFunc,
-		DownloadErrFunc: geoipDownloadErrFunc,
+	gLoader := &utils.GeoLoader{
+		GeoIPFilename:   c.ACL.GeoIP,
+		GeoSiteFilename: c.ACL.GeoSite,
+		UpdateInterval:  c.ACL.GeoUpdateInterval,
+		DownloadFunc:    geoDownloadFunc,
+		DownloadErrFunc: geoDownloadErrFunc,
 	}
 	if c.ACL.File != "" {
 		hasACL = true
-		acl, err := outbounds.NewACLEngineFromFile(c.ACL.File, obs, gLoader.Load)
+		acl, err := outbounds.NewACLEngineFromFile(c.ACL.File, obs, gLoader)
 		if err != nil {
 			return configError{Field: "acl.file", Err: err}
 		}
 		uOb = acl
 	} else if len(c.ACL.Inline) > 0 {
 		hasACL = true
-		acl, err := outbounds.NewACLEngineFromString(strings.Join(c.ACL.Inline, "\n"), obs, gLoader.Load)
+		acl, err := outbounds.NewACLEngineFromString(strings.Join(c.ACL.Inline, "\n"), obs, gLoader)
 		if err != nil {
 			return configError{Field: "acl.inline", Err: err}
 		}
@@ -594,7 +605,7 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	if c.TrafficStats.Listen != "" {
-		tss := trafficlogger.NewTrafficStatsServer()
+		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
 		hyConfig.TrafficLogger = tss
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
 	}
@@ -726,7 +737,11 @@ func runServer(cmd *cobra.Command, args []string) {
 	if err != nil {
 		logger.Fatal("failed to initialize server", zap.Error(err))
 	}
-	logger.Info("server up and running")
+	if config.Listen != "" {
+		logger.Info("server up and running", zap.String("listen", config.Listen))
+	} else {
+		logger.Info("server up and running", zap.String("listen", defaultListenAddr))
+	}
 
 	if !disableUpdateCheck {
 		go runCheckUpdateServer()
@@ -739,7 +754,7 @@ func runServer(cmd *cobra.Command, args []string) {
 
 func runTrafficStatsServer(listen string, handler http.Handler) {
 	logger.Info("traffic stats server up and running", zap.String("listen", listen))
-	if err := http.ListenAndServe(listen, handler); err != nil {
+	if err := correctnet.HTTPListenAndServe(listen, handler); err != nil {
 		logger.Fatal("failed to serve traffic stats", zap.Error(err))
 	}
 }
@@ -764,13 +779,13 @@ func runMasqTCPServer(s *masq.MasqTCPServer, httpAddr, httpsAddr string) {
 	}
 }
 
-func geoipDownloadFunc(filename, url string) {
-	logger.Info("downloading GeoIP database", zap.String("filename", filename), zap.String("url", url))
+func geoDownloadFunc(filename, url string) {
+	logger.Info("downloading database", zap.String("filename", filename), zap.String("url", url))
 }
 
-func geoipDownloadErrFunc(err error) {
+func geoDownloadErrFunc(err error) {
 	if err != nil {
-		logger.Error("failed to download GeoIP database", zap.Error(err))
+		logger.Error("failed to download database", zap.Error(err))
 	}
 }
 
