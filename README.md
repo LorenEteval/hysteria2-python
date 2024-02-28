@@ -1,6 +1,6 @@
 # hysteria2-python
 
-[![Build hysteria2 binding](https://github.com/LorenEteval/hysteria2-python/actions/workflows/wheels.yml/badge.svg?branch=main)](https://github.com/LorenEteval/hysteria2-python/actions/workflows/wheels.yml)
+[![Deploy PyPI](https://github.com/LorenEteval/hysteria2-python/actions/workflows/deploy-pypi.yml/badge.svg?branch=main)](https://github.com/LorenEteval/hysteria2-python/actions/workflows/deploy-pypi.yml)
 
 Python bindings for [hysteria2](https://github.com/apernet/hysteria).
 
