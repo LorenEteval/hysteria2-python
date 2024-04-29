@@ -26,6 +26,10 @@ quic:
   maxIdleTimeout: 10s
   keepAlivePeriod: 4s
   disablePathMTUDiscovery: true
+  sockopts:
+    bindInterface: eth0
+    fwmark: 1234
+    fdControlUnixSocket: test.sock
 
 bandwidth:
   up: 200 mbps
@@ -65,3 +69,17 @@ udpTProxy:
 
 tcpRedirect:
   listen: 127.0.0.1:3500
+
+tun:
+  name: "hytun"
+  mtu: 1500
+  timeout: 1m
+  address:
+    ipv4: 100.100.100.101/30
+    ipv6: 2001::ffff:ffff:ffff:fff1/126
+  route:
+    strict: true
+    ipv4: [ 0.0.0.0/0 ]
+    ipv6: [ "2000::/3" ]
+    ipv4Exclude: [ 192.0.2.1/32 ]
+    ipv6Exclude: [ "2001:db8::1/128" ]

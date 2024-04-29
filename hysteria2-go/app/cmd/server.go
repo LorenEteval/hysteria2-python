@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -83,6 +84,7 @@ type serverConfigACME struct {
 	CA             string   `mapstructure:"ca"`
 	DisableHTTP    bool     `mapstructure:"disableHTTP"`
 	DisableTLSALPN bool     `mapstructure:"disableTLSALPN"`
+	ListenHost     string   `mapstructure:"listenHost"`
 	AltHTTPPort    int      `mapstructure:"altHTTPPort"`
 	AltTLSALPNPort int      `mapstructure:"altTLSALPNPort"`
 	Dir            string   `mapstructure:"dir"`
@@ -253,6 +255,20 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 		if c.TLS.Cert == "" || c.TLS.Key == "" {
 			return configError{Field: "tls", Err: errors.New("empty cert or key path")}
 		}
+		// Try loading the cert-key pair here to catch errors early
+		// (e.g. invalid files or insufficient permissions)
+		certPEMBlock, err := os.ReadFile(c.TLS.Cert)
+		if err != nil {
+			return configError{Field: "tls.cert", Err: err}
+		}
+		keyPEMBlock, err := os.ReadFile(c.TLS.Key)
+		if err != nil {
+			return configError{Field: "tls.key", Err: err}
+		}
+		_, err = tls.X509KeyPair(certPEMBlock, keyPEMBlock)
+		if err != nil {
+			return configError{Field: "tls", Err: fmt.Errorf("invalid cert-key pair: %w", err)}
+		}
 		// Use GetCertificate instead of Certificates so that
 		// users can update the cert without restarting the server.
 		hyConfig.TLSConfig.GetCertificate = func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -280,6 +296,7 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			Agreed:                  true,
 			DisableHTTPChallenge:    c.ACME.DisableHTTP,
 			DisableTLSALPNChallenge: c.ACME.DisableTLSALPN,
+			ListenHost:              c.ACME.ListenHost,
 			AltHTTPPort:             c.ACME.AltHTTPPort,
 			AltTLSALPNPort:          c.ACME.AltTLSALPNPort,
 			Logger:                  logger,
@@ -813,7 +830,7 @@ func (l *serverLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("TCP closed", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr))
 	} else {
-		logger.Error("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr), zap.Error(err))
+		logger.Warn("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr), zap.Error(err))
 	}
 }
 
@@ -825,7 +842,7 @@ func (l *serverLogger) UDPError(addr net.Addr, id string, sessionID uint32, err 
 	if err == nil {
 		logger.Debug("UDP closed", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID))
 	} else {
-		logger.Error("UDP error", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.Error(err))
+		logger.Warn("UDP error", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.Error(err))
 	}
 }
 

@@ -6,8 +6,12 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
+	"net/netip"
 	"os"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,9 +22,12 @@ import (
 
 	"github.com/apernet/hysteria/app/internal/forwarding"
 	"github.com/apernet/hysteria/app/internal/http"
+	"github.com/apernet/hysteria/app/internal/proxymux"
 	"github.com/apernet/hysteria/app/internal/redirect"
+	"github.com/apernet/hysteria/app/internal/sockopts"
 	"github.com/apernet/hysteria/app/internal/socks5"
 	"github.com/apernet/hysteria/app/internal/tproxy"
+	"github.com/apernet/hysteria/app/internal/tun"
 	"github.com/apernet/hysteria/app/internal/url"
 	"github.com/apernet/hysteria/app/internal/utils"
 	"github.com/apernet/hysteria/core/client"
@@ -66,6 +73,7 @@ type clientConfig struct {
 	TCPTProxy     *tcpTProxyConfig      `mapstructure:"tcpTProxy"`
 	UDPTProxy     *udpTProxyConfig      `mapstructure:"udpTProxy"`
 	TCPRedirect   *tcpRedirectConfig    `mapstructure:"tcpRedirect"`
+	TUN           *tunConfig            `mapstructure:"tun"`
 }
 
 type clientConfigTransportUDP struct {
@@ -94,13 +102,20 @@ type clientConfigTLS struct {
 }
 
 type clientConfigQUIC struct {
-	InitStreamReceiveWindow     uint64        `mapstructure:"initStreamReceiveWindow"`
-	MaxStreamReceiveWindow      uint64        `mapstructure:"maxStreamReceiveWindow"`
-	InitConnectionReceiveWindow uint64        `mapstructure:"initConnReceiveWindow"`
-	MaxConnectionReceiveWindow  uint64        `mapstructure:"maxConnReceiveWindow"`
-	MaxIdleTimeout              time.Duration `mapstructure:"maxIdleTimeout"`
-	KeepAlivePeriod             time.Duration `mapstructure:"keepAlivePeriod"`
-	DisablePathMTUDiscovery     bool          `mapstructure:"disablePathMTUDiscovery"`
+	InitStreamReceiveWindow     uint64                   `mapstructure:"initStreamReceiveWindow"`
+	MaxStreamReceiveWindow      uint64                   `mapstructure:"maxStreamReceiveWindow"`
+	InitConnectionReceiveWindow uint64                   `mapstructure:"initConnReceiveWindow"`
+	MaxConnectionReceiveWindow  uint64                   `mapstructure:"maxConnReceiveWindow"`
+	MaxIdleTimeout              time.Duration            `mapstructure:"maxIdleTimeout"`
+	KeepAlivePeriod             time.Duration            `mapstructure:"keepAlivePeriod"`
+	DisablePathMTUDiscovery     bool                     `mapstructure:"disablePathMTUDiscovery"`
+	Sockopts                    clientConfigQUICSockopts `mapstructure:"sockopts"`
+}
+
+type clientConfigQUICSockopts struct {
+	BindInterface       *string `mapstructure:"bindInterface"`
+	FirewallMark        *uint32 `mapstructure:"fwmark"`
+	FdControlUnixSocket *string `mapstructure:"fdControlUnixSocket"`
 }
 
 type clientConfigBandwidth struct {
@@ -146,6 +161,23 @@ type tcpRedirectConfig struct {
 	Listen string `mapstructure:"listen"`
 }
 
+type tunConfig struct {
+	Name    string        `mapstructure:"name"`
+	MTU     uint32        `mapstructure:"mtu"`
+	Timeout time.Duration `mapstructure:"timeout"`
+	Address struct {
+		IPv4 string `mapstructure:"ipv4"`
+		IPv6 string `mapstructure:"ipv6"`
+	} `mapstructure:"address"`
+	Route *struct {
+		Strict      bool     `mapstructure:"strict"`
+		IPv4        []string `mapstructure:"ipv4"`
+		IPv6        []string `mapstructure:"ipv6"`
+		IPv4Exclude []string `mapstructure:"ipv4Exclude"`
+		IPv6Exclude []string `mapstructure:"ipv6Exclude"`
+	} `mapstructure:"route"`
+}
+
 func (c *clientConfig) fillServerAddr(hyConfig *client.Config) error {
 	if c.Server == "" {
 		return configError{Field: "server", Err: errors.New("server address is empty")}
@@ -173,6 +205,21 @@ func (c *clientConfig) fillServerAddr(hyConfig *client.Config) error {
 // fillConnFactory must be called after fillServerAddr, as we have different logic
 // for ConnFactory depending on whether we have a port hopping address.
 func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
+	so := &sockopts.SocketOptions{
+		BindInterface:       c.QUIC.Sockopts.BindInterface,
+		FirewallMark:        c.QUIC.Sockopts.FirewallMark,
+		FdControlUnixSocket: c.QUIC.Sockopts.FdControlUnixSocket,
+	}
+	if err := so.CheckSupported(); err != nil {
+		var unsupportedErr *sockopts.UnsupportedError
+		if errors.As(err, &unsupportedErr) {
+			return configError{
+				Field: "quic.sockopts." + unsupportedErr.Field,
+				Err:   errors.New("unsupported on this platform"),
+			}
+		}
+		return configError{Field: "quic.sockopts", Err: err}
+	}
 	// Inner PacketConn
 	var newFunc func(addr net.Addr) (net.PacketConn, error)
 	switch strings.ToLower(c.Transport.Type) {
@@ -180,11 +227,11 @@ func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
 		if hyConfig.ServerAddr.Network() == "udphop" {
 			hopAddr := hyConfig.ServerAddr.(*udphop.UDPHopAddr)
 			newFunc = func(addr net.Addr) (net.PacketConn, error) {
-				return udphop.NewUDPHopPacketConn(hopAddr, c.Transport.UDP.HopInterval, nil)
+				return udphop.NewUDPHopPacketConn(hopAddr, c.Transport.UDP.HopInterval, so.ListenUDP)
 			}
 		} else {
 			newFunc = func(addr net.Addr) (net.PacketConn, error) {
-				return net.ListenUDP("udp", nil)
+				return so.ListenUDP()
 			}
 		}
 	default:
@@ -544,6 +591,11 @@ func runClient(cmd *cobra.Command, args []string) {
 			return clientTCPRedirect(*config.TCPRedirect, c)
 		})
 	}
+	if config.TUN != nil {
+		runner.Add("TUN", func() error {
+			return clientTUN(*config.TUN, c)
+		})
+	}
 
 	runner.Run()
 }
@@ -588,7 +640,7 @@ func clientSOCKS5(config socks5Config, c client.Client) error {
 	if config.Listen == "" {
 		return configError{Field: "listen", Err: errors.New("listen address is empty")}
 	}
-	l, err := correctnet.Listen("tcp", config.Listen)
+	l, err := proxymux.ListenSOCKS(config.Listen)
 	if err != nil {
 		return configError{Field: "listen", Err: err}
 	}
@@ -613,7 +665,7 @@ func clientHTTP(config httpConfig, c client.Client) error {
 	if config.Listen == "" {
 		return configError{Field: "listen", Err: errors.New("listen address is empty")}
 	}
-	l, err := correctnet.Listen("tcp", config.Listen)
+	l, err := proxymux.ListenHTTP(config.Listen)
 	if err != nil {
 		return configError{Field: "listen", Err: err}
 	}
@@ -741,6 +793,92 @@ func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
 	return p.ListenAndServe(laddr)
 }
 
+func clientTUN(config tunConfig, c client.Client) error {
+	supportedPlatforms := []string{"linux", "darwin", "windows", "android"}
+	if !slices.Contains(supportedPlatforms, runtime.GOOS) {
+		logger.Error("TUN is not supported on this platform", zap.String("platform", runtime.GOOS))
+	}
+	if config.Name == "" {
+		return configError{Field: "name", Err: errors.New("name is empty")}
+	}
+	if config.MTU == 0 {
+		config.MTU = 1500
+	}
+	timeout := int64(config.Timeout.Seconds())
+	if timeout == 0 {
+		timeout = 300
+	}
+	if config.Address.IPv4 == "" {
+		config.Address.IPv4 = "100.100.100.101/30"
+	}
+	prefix4, err := netip.ParsePrefix(config.Address.IPv4)
+	if err != nil {
+		return configError{Field: "address.ipv4", Err: err}
+	}
+	if config.Address.IPv6 == "" {
+		config.Address.IPv6 = "2001::ffff:ffff:ffff:fff1/126"
+	}
+	prefix6, err := netip.ParsePrefix(config.Address.IPv6)
+	if err != nil {
+		return configError{Field: "address.ipv6", Err: err}
+	}
+	server := &tun.Server{
+		HyClient:     c,
+		EventLogger:  &tunLogger{},
+		Logger:       logger,
+		IfName:       config.Name,
+		MTU:          config.MTU,
+		Timeout:      timeout,
+		Inet4Address: []netip.Prefix{prefix4},
+		Inet6Address: []netip.Prefix{prefix6},
+	}
+	if config.Route != nil {
+		server.AutoRoute = true
+		server.StructRoute = config.Route.Strict
+
+		parsePrefixes := func(field string, ss []string) ([]netip.Prefix, error) {
+			var prefixes []netip.Prefix
+			for i, s := range ss {
+				var p netip.Prefix
+				if strings.Contains(s, "/") {
+					var err error
+					p, err = netip.ParsePrefix(s)
+					if err != nil {
+						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
+					}
+				} else {
+					pa, err := netip.ParseAddr(s)
+					if err != nil {
+						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
+					}
+					p = netip.PrefixFrom(pa, pa.BitLen())
+				}
+				prefixes = append(prefixes, p)
+			}
+			return prefixes, nil
+		}
+
+		server.Inet4RouteAddress, err = parsePrefixes("route.ipv4", config.Route.IPv4)
+		if err != nil {
+			return err
+		}
+		server.Inet6RouteAddress, err = parsePrefixes("route.ipv6", config.Route.IPv6)
+		if err != nil {
+			return err
+		}
+		server.Inet4RouteExcludeAddress, err = parsePrefixes("route.ipv4Exclude", config.Route.IPv4Exclude)
+		if err != nil {
+			return err
+		}
+		server.Inet6RouteExcludeAddress, err = parsePrefixes("route.ipv6Exclude", config.Route.IPv6Exclude)
+		if err != nil {
+			return err
+		}
+	}
+	logger.Info("TUN listening", zap.String("interface", config.Name))
+	return server.Serve()
+}
+
 // parseServerAddrString parses server address string.
 // Server address can be in either "host:port" or "host" format (in which case we assume port 443).
 func parseServerAddrString(addrStr string) (host, port, hostPort string) {
@@ -800,7 +938,7 @@ func (l *socks5Logger) TCPError(addr net.Addr, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("SOCKS5 TCP closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
 	} else {
-		logger.Error("SOCKS5 TCP error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+		logger.Warn("SOCKS5 TCP error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
 	}
 }
 
@@ -812,7 +950,7 @@ func (l *socks5Logger) UDPError(addr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("SOCKS5 UDP closed", zap.String("addr", addr.String()))
 	} else {
-		logger.Error("SOCKS5 UDP error", zap.String("addr", addr.String()), zap.Error(err))
+		logger.Warn("SOCKS5 UDP error", zap.String("addr", addr.String()), zap.Error(err))
 	}
 }
 
@@ -826,7 +964,7 @@ func (l *httpLogger) ConnectError(addr net.Addr, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("HTTP CONNECT closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
 	} else {
-		logger.Error("HTTP CONNECT error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+		logger.Warn("HTTP CONNECT error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
 	}
 }
 
@@ -838,7 +976,7 @@ func (l *httpLogger) HTTPError(addr net.Addr, reqURL string, err error) {
 	if err == nil {
 		logger.Debug("HTTP closed", zap.String("addr", addr.String()), zap.String("reqURL", reqURL))
 	} else {
-		logger.Error("HTTP error", zap.String("addr", addr.String()), zap.String("reqURL", reqURL), zap.Error(err))
+		logger.Warn("HTTP error", zap.String("addr", addr.String()), zap.String("reqURL", reqURL), zap.Error(err))
 	}
 }
 
@@ -852,7 +990,7 @@ func (l *tcpLogger) Error(addr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("TCP forwarding closed", zap.String("addr", addr.String()))
 	} else {
-		logger.Error("TCP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
+		logger.Warn("TCP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
 	}
 }
 
@@ -866,7 +1004,7 @@ func (l *udpLogger) Error(addr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("UDP forwarding closed", zap.String("addr", addr.String()))
 	} else {
-		logger.Error("UDP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
+		logger.Warn("UDP forwarding error", zap.String("addr", addr.String()), zap.Error(err))
 	}
 }
 
@@ -880,7 +1018,7 @@ func (l *tcpTProxyLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("TCP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 	} else {
-		logger.Error("TCP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		logger.Warn("TCP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
 	}
 }
 
@@ -894,7 +1032,7 @@ func (l *udpTProxyLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("UDP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 	} else {
-		logger.Error("UDP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		logger.Warn("UDP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
 	}
 }
 
@@ -908,6 +1046,32 @@ func (l *tcpRedirectLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("TCP redirect closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
 	} else {
-		logger.Error("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		logger.Warn("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+	}
+}
+
+type tunLogger struct{}
+
+func (l *tunLogger) TCPRequest(addr, reqAddr string) {
+	logger.Debug("TUN TCP request", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
+}
+
+func (l *tunLogger) TCPError(addr, reqAddr string, err error) {
+	if err == nil {
+		logger.Debug("TUN TCP closed", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
+	} else {
+		logger.Warn("TUN TCP error", zap.String("addr", addr), zap.String("reqAddr", reqAddr), zap.Error(err))
+	}
+}
+
+func (l *tunLogger) UDPRequest(addr string) {
+	logger.Debug("TUN UDP request", zap.String("addr", addr))
+}
+
+func (l *tunLogger) UDPError(addr string, err error) {
+	if err == nil {
+		logger.Debug("TUN UDP closed", zap.String("addr", addr))
+	} else {
+		logger.Warn("TUN UDP error", zap.String("addr", addr), zap.Error(err))
 	}
 }

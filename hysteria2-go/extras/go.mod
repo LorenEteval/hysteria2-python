@@ -9,13 +9,13 @@ require (
 	github.com/miekg/dns v1.1.55
 	github.com/stretchr/testify v1.8.4
 	github.com/txthinking/socks5 v0.0.0-20230325130024-4230056ae301
-	golang.org/x/crypto v0.17.0
-	golang.org/x/net v0.17.0
-	google.golang.org/protobuf v1.28.1
+	golang.org/x/crypto v0.22.0
+	golang.org/x/net v0.24.0
+	google.golang.org/protobuf v1.33.0
 )
 
 require (
-	github.com/apernet/quic-go v0.41.1-0.20240301003057-e18162de481d // indirect
+	github.com/apernet/quic-go v0.43.1-0.20240429030958-51a0843014d6 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect
 	github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 // indirect
@@ -25,10 +25,10 @@ require (
 	github.com/quic-go/qpack v0.4.0 // indirect
 	github.com/stretchr/objx v0.5.0 // indirect
 	github.com/txthinking/runnergroup v0.0.0-20210608031112-152c7c4432bf // indirect
-	go.uber.org/mock v0.3.0 // indirect
+	go.uber.org/mock v0.4.0 // indirect
 	golang.org/x/exp v0.0.0-20221205204356-47842c84f3db // indirect
 	golang.org/x/mod v0.12.0 // indirect
-	golang.org/x/sys v0.15.0 // indirect
+	golang.org/x/sys v0.19.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 	golang.org/x/tools v0.11.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
