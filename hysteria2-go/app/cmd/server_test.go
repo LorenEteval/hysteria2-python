@@ -34,13 +34,28 @@ func TestServerConfig(t *testing.T) {
 				"sub1.example.com",
 				"sub2.example.com",
 			},
-			Email:          "haha@cringe.net",
-			CA:             "zero",
+			Email:      "haha@cringe.net",
+			CA:         "zero",
+			ListenHost: "127.0.0.9",
+			Dir:        "random_dir",
+			Type:       "dns",
+			HTTP: serverConfigACMEHTTP{
+				AltPort: 8888,
+			},
+			TLS: serverConfigACMETLS{
+				AltPort: 44333,
+			},
+			DNS: serverConfigACMEDNS{
+				Name: "gomommy",
+				Config: map[string]string{
+					"key1": "value1",
+					"key2": "value2",
+				},
+			},
 			DisableHTTP:    true,
 			DisableTLSALPN: true,
-			AltHTTPPort:    9980,
-			AltTLSALPNPort: 9443,
-			Dir:            "random_dir",
+			AltHTTPPort:    8080,
+			AltTLSALPNPort: 4433,
 		},
 		QUIC: serverConfigQUIC{
 			InitStreamReceiveWindow:     77881,
@@ -95,6 +110,13 @@ func TestServerConfig(t *testing.T) {
 				SNI:      "real.stuff.net",
 				Insecure: true,
 			},
+		},
+		Sniff: serverConfigSniff{
+			Enable:        true,
+			Timeout:       1 * time.Second,
+			RewriteDomain: true,
+			TCPPorts:      "80,443,1000-2000",
+			UDPPorts:      "443",
 		},
 		ACL: serverConfigACL{
 			File: "chnroute.txt",

@@ -16,19 +16,27 @@ import (
 	"time"
 
 	"github.com/caddyserver/certmagic"
+	"github.com/libdns/cloudflare"
+	"github.com/libdns/duckdns"
+	"github.com/libdns/gandi"
+	"github.com/libdns/godaddy"
+	"github.com/libdns/namedotcom"
+	"github.com/libdns/vultr"
 	"github.com/mholt/acmez/acme"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
-	"github.com/apernet/hysteria/app/internal/utils"
-	"github.com/apernet/hysteria/core/server"
-	"github.com/apernet/hysteria/extras/auth"
-	"github.com/apernet/hysteria/extras/correctnet"
-	"github.com/apernet/hysteria/extras/masq"
-	"github.com/apernet/hysteria/extras/obfs"
-	"github.com/apernet/hysteria/extras/outbounds"
-	"github.com/apernet/hysteria/extras/trafficlogger"
+	"github.com/apernet/hysteria/app/v2/internal/utils"
+	"github.com/apernet/hysteria/core/v2/server"
+	"github.com/apernet/hysteria/extras/v2/auth"
+	"github.com/apernet/hysteria/extras/v2/correctnet"
+	"github.com/apernet/hysteria/extras/v2/masq"
+	"github.com/apernet/hysteria/extras/v2/obfs"
+	"github.com/apernet/hysteria/extras/v2/outbounds"
+	"github.com/apernet/hysteria/extras/v2/sniff"
+	"github.com/apernet/hysteria/extras/v2/trafficlogger"
+	eUtils "github.com/apernet/hysteria/extras/v2/utils"
 )
 
 const (
@@ -58,6 +66,7 @@ type serverConfig struct {
 	UDPIdleTimeout        time.Duration               `mapstructure:"udpIdleTimeout"`
 	Auth                  serverConfigAuth            `mapstructure:"auth"`
 	Resolver              serverConfigResolver        `mapstructure:"resolver"`
+	Sniff                 serverConfigSniff           `mapstructure:"sniff"`
 	ACL                   serverConfigACL             `mapstructure:"acl"`
 	Outbounds             []serverConfigOutboundEntry `mapstructure:"outbounds"`
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
@@ -79,15 +88,38 @@ type serverConfigTLS struct {
 }
 
 type serverConfigACME struct {
-	Domains        []string `mapstructure:"domains"`
-	Email          string   `mapstructure:"email"`
-	CA             string   `mapstructure:"ca"`
-	DisableHTTP    bool     `mapstructure:"disableHTTP"`
-	DisableTLSALPN bool     `mapstructure:"disableTLSALPN"`
-	ListenHost     string   `mapstructure:"listenHost"`
-	AltHTTPPort    int      `mapstructure:"altHTTPPort"`
-	AltTLSALPNPort int      `mapstructure:"altTLSALPNPort"`
-	Dir            string   `mapstructure:"dir"`
+	// Common fields
+	Domains    []string `mapstructure:"domains"`
+	Email      string   `mapstructure:"email"`
+	CA         string   `mapstructure:"ca"`
+	ListenHost string   `mapstructure:"listenHost"`
+	Dir        string   `mapstructure:"dir"`
+
+	// Type selection
+	Type string               `mapstructure:"type"`
+	HTTP serverConfigACMEHTTP `mapstructure:"http"`
+	TLS  serverConfigACMETLS  `mapstructure:"tls"`
+	DNS  serverConfigACMEDNS  `mapstructure:"dns"`
+
+	// Legacy fields for backwards compatibility
+	// Only applicable when Type is empty
+	DisableHTTP    bool `mapstructure:"disableHTTP"`
+	DisableTLSALPN bool `mapstructure:"disableTLSALPN"`
+	AltHTTPPort    int  `mapstructure:"altHTTPPort"`
+	AltTLSALPNPort int  `mapstructure:"altTLSALPNPort"`
+}
+
+type serverConfigACMEHTTP struct {
+	AltPort int `mapstructure:"altPort"`
+}
+
+type serverConfigACMETLS struct {
+	AltPort int `mapstructure:"altPort"`
+}
+
+type serverConfigACMEDNS struct {
+	Name   string            `mapstructure:"name"`
+	Config map[string]string `mapstructure:"config"`
 }
 
 type serverConfigQUIC struct {
@@ -148,6 +180,14 @@ type serverConfigResolver struct {
 	UDP   serverConfigResolverUDP   `mapstructure:"udp"`
 	TLS   serverConfigResolverTLS   `mapstructure:"tls"`
 	HTTPS serverConfigResolverHTTPS `mapstructure:"https"`
+}
+
+type serverConfigSniff struct {
+	Enable        bool          `mapstructure:"enable"`
+	Timeout       time.Duration `mapstructure:"timeout"`
+	RewriteDomain bool          `mapstructure:"rewriteDomain"`
+	TCPPorts      string        `mapstructure:"tcpPorts"`
+	UDPPorts      string        `mapstructure:"udpPorts"`
 }
 
 type serverConfigACL struct {
@@ -292,14 +332,10 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			Logger:             logger,
 		}
 		cmIssuer := certmagic.NewACMEIssuer(cmCfg, certmagic.ACMEIssuer{
-			Email:                   c.ACME.Email,
-			Agreed:                  true,
-			DisableHTTPChallenge:    c.ACME.DisableHTTP,
-			DisableTLSALPNChallenge: c.ACME.DisableTLSALPN,
-			ListenHost:              c.ACME.ListenHost,
-			AltHTTPPort:             c.ACME.AltHTTPPort,
-			AltTLSALPNPort:          c.ACME.AltTLSALPNPort,
-			Logger:                  logger,
+			Email:      c.ACME.Email,
+			Agreed:     true,
+			ListenHost: c.ACME.ListenHost,
+			Logger:     logger,
 		})
 		switch strings.ToLower(c.ACME.CA) {
 		case "letsencrypt", "le", "":
@@ -313,8 +349,82 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			}
 			cmIssuer.ExternalAccount = eab
 		default:
-			return configError{Field: "acme.ca", Err: errors.New("unknown CA")}
+			return configError{Field: "acme.ca", Err: errors.New("unsupported CA")}
 		}
+
+		switch strings.ToLower(c.ACME.Type) {
+		case "http":
+			cmIssuer.DisableHTTPChallenge = false
+			cmIssuer.DisableTLSALPNChallenge = true
+			cmIssuer.DNS01Solver = nil
+			cmIssuer.AltHTTPPort = c.ACME.HTTP.AltPort
+		case "tls":
+			cmIssuer.DisableHTTPChallenge = true
+			cmIssuer.DisableTLSALPNChallenge = false
+			cmIssuer.DNS01Solver = nil
+			cmIssuer.AltTLSALPNPort = c.ACME.TLS.AltPort
+		case "dns":
+			cmIssuer.DisableHTTPChallenge = true
+			cmIssuer.DisableTLSALPNChallenge = true
+			if c.ACME.DNS.Name == "" {
+				return configError{Field: "acme.dns.name", Err: errors.New("empty DNS provider name")}
+			}
+			if c.ACME.DNS.Config == nil {
+				return configError{Field: "acme.dns.config", Err: errors.New("empty DNS provider config")}
+			}
+			switch strings.ToLower(c.ACME.DNS.Name) {
+			case "cloudflare":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &cloudflare.Provider{
+						APIToken: c.ACME.DNS.Config["cloudflare_api_token"],
+					},
+				}
+			case "duckdns":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &duckdns.Provider{
+						APIToken:       c.ACME.DNS.Config["duckdns_api_token"],
+						OverrideDomain: c.ACME.DNS.Config["duckdns_override_domain"],
+					},
+				}
+			case "gandi":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &gandi.Provider{
+						BearerToken: c.ACME.DNS.Config["gandi_api_token"],
+					},
+				}
+			case "godaddy":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &godaddy.Provider{
+						APIToken: c.ACME.DNS.Config["godaddy_api_token"],
+					},
+				}
+			case "namedotcom":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &namedotcom.Provider{
+						Token:  c.ACME.DNS.Config["namedotcom_token"],
+						User:   c.ACME.DNS.Config["namedotcom_user"],
+						Server: c.ACME.DNS.Config["namedotcom_server"],
+					},
+				}
+			case "vultr":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &vultr.Provider{
+						APIToken: c.ACME.DNS.Config["vultr_api_token"],
+					},
+				}
+			default:
+				return configError{Field: "acme.dns.name", Err: errors.New("unsupported DNS provider")}
+			}
+		case "":
+			// Legacy compatibility mode
+			cmIssuer.DisableHTTPChallenge = c.ACME.DisableHTTP
+			cmIssuer.DisableTLSALPNChallenge = c.ACME.DisableTLSALPN
+			cmIssuer.AltHTTPPort = c.ACME.AltHTTPPort
+			cmIssuer.AltTLSALPNPort = c.ACME.AltTLSALPNPort
+		default:
+			return configError{Field: "acme.type", Err: errors.New("unsupported ACME type")}
+		}
+
 		cmCfg.Issuers = []certmagic.Issuer{cmIssuer}
 		cmCache := certmagic.NewCache(certmagic.CacheOptions{
 			GetConfigForCert: func(cert certmagic.Certificate) (*certmagic.Config, error) {
@@ -440,6 +550,29 @@ func serverConfigOutboundHTTPToOutbound(c serverConfigOutboundHTTP) (outbounds.P
 		return nil, configError{Field: "outbounds.http.url", Err: errors.New("empty http address")}
 	}
 	return outbounds.NewHTTPOutbound(c.URL, c.Insecure)
+}
+
+func (c *serverConfig) fillRequestHook(hyConfig *server.Config) error {
+	if c.Sniff.Enable {
+		s := &sniff.Sniffer{
+			Timeout:       c.Sniff.Timeout,
+			RewriteDomain: c.Sniff.RewriteDomain,
+		}
+		if c.Sniff.TCPPorts != "" {
+			s.TCPPorts = eUtils.ParsePortUnion(c.Sniff.TCPPorts)
+			if s.TCPPorts == nil {
+				return configError{Field: "sniff.tcpPorts", Err: errors.New("invalid port union")}
+			}
+		}
+		if c.Sniff.UDPPorts != "" {
+			s.UDPPorts = eUtils.ParsePortUnion(c.Sniff.UDPPorts)
+			if s.UDPPorts == nil {
+				return configError{Field: "sniff.udpPorts", Err: errors.New("invalid port union")}
+			}
+		}
+		hyConfig.RequestHook = s
+	}
+	return nil
 }
 
 func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
@@ -722,6 +855,7 @@ func (c *serverConfig) Config() (*server.Config, error) {
 		c.fillConn,
 		c.fillTLSConfig,
 		c.fillQUICConfig,
+		c.fillRequestHook,
 		c.fillOutboundConfig,
 		c.fillBandwidthConfig,
 		c.fillIgnoreClientBandwidth,

@@ -3,16 +3,19 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
-	"github.com/apernet/hysteria/core/client"
-	hyErrors "github.com/apernet/hysteria/core/errors"
-	"github.com/apernet/hysteria/extras/outbounds"
-	"github.com/apernet/hysteria/extras/outbounds/speedtest"
+	"github.com/apernet/hysteria/core/v2/client"
+	hyErrors "github.com/apernet/hysteria/core/v2/errors"
+	"github.com/apernet/hysteria/extras/v2/outbounds"
+	"github.com/apernet/hysteria/extras/v2/outbounds/speedtest"
 )
 
 var (
@@ -68,11 +71,26 @@ func runSpeedtest(cmd *cobra.Command, args []string) {
 		zap.Bool("udpEnabled", info.UDPEnabled),
 		zap.Uint64("tx", info.Tx))
 
-	if !skipDownload {
-		runDownloadTest(c)
-	}
-	if !skipUpload {
-		runUploadTest(c)
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalChan)
+
+	runChan := make(chan struct{}, 1)
+	go func() {
+		if !skipDownload {
+			runDownloadTest(c)
+		}
+		if !skipUpload {
+			runUploadTest(c)
+		}
+		runChan <- struct{}{}
+	}()
+
+	select {
+	case <-signalChan:
+		logger.Info("received signal, shutting down gracefully")
+	case <-runChan:
+		logger.Info("speed test complete")
 	}
 }
 
@@ -152,8 +170,8 @@ func formatSpeed(bytes uint32, duration time.Duration, useBytes bool) string {
 		speed *= 8
 	}
 	unitIndex := 0
-	for speed > 1024 && unitIndex < len(units)-1 {
-		speed /= 1024
+	for speed > 1000 && unitIndex < len(units)-1 {
+		speed /= 1000
 		unitIndex++
 	}
 	return fmt.Sprintf("%.2f %s", speed, units[unitIndex])

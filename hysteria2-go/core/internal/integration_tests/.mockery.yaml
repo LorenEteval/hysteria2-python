@@ -7,7 +7,7 @@ packages:
       Conn:
         config:
           mockname: MockConn
-  github.com/apernet/hysteria/core/server:
+  github.com/apernet/hysteria/core/v2/server:
     interfaces:
       Outbound:
         config:
@@ -24,3 +24,6 @@ packages:
       TrafficLogger:
         config:
           mockname: MockTrafficLogger
+      RequestHook:
+        config:
+          mockname: MockRequestHook
