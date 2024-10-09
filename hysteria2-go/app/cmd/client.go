@@ -394,7 +394,11 @@ func (c *clientConfig) parseURI() bool {
 		return false
 	}
 	if u.User != nil {
-		c.Auth = u.User.String()
+		auth, err := url.QueryUnescape(u.User.String())
+		if err != nil {
+			return false
+		}
+		c.Auth = auth
 	}
 	c.Server = u.Host
 	q := u.Query()
@@ -518,8 +522,36 @@ func StartFromJSON(json string) {
 			return clientTCPRedirect(*config.TCPRedirect, c)
 		})
 	}
+	if config.TUN != nil {
+		runner.Add("TUN", func() error {
+			return clientTUN(*config.TUN, c)
+		})
+	}
 
-	runner.Run()
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalChan)
+
+	runnerChan := make(chan clientModeRunnerResult, 1)
+	go func() {
+		runnerChan <- runner.Run()
+	}()
+
+	select {
+	case <-signalChan:
+		logger.Info("received signal, shutting down gracefully")
+	case r := <-runnerChan:
+		if r.OK {
+			logger.Info(r.Msg)
+		} else {
+			_ = c.Close() // Close the client here as Fatal will exit the program without running defer
+			if r.Err != nil {
+				logger.Fatal(r.Msg, zap.Error(r.Err))
+			} else {
+				logger.Fatal(r.Msg)
+			}
+		}
+	}
 }
 
 func runClient(cmd *cobra.Command, args []string) {
