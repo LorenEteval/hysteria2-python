@@ -436,6 +436,9 @@ check_environment_architecture() {
     's390x')
       ARCHITECTURE='s390x'
       ;;
+    'loongarch64')
+      ARCHITECTURE='loong64'
+      ;;
     *)
       error "The architecture '$(uname -a)' is not supported."
       note "Specify ARCHITECTURE=<architecture> to bypass this check and force this script to run on this $(uname -m)."
@@ -872,7 +875,7 @@ is_hysteria1_version() {
 get_installed_version() {
   if is_hysteria_installed; then
     if "$EXECUTABLE_INSTALL_PATH" version > /dev/null 2>&1; then
-      "$EXECUTABLE_INSTALL_PATH" version | grep Version | grep -o 'v[.0-9]*'
+      "$EXECUTABLE_INSTALL_PATH" version | grep '^Version' | grep -o 'v[.0-9]*'
     elif "$EXECUTABLE_INSTALL_PATH" -v > /dev/null 2>&1; then
       # hysteria 1
       "$EXECUTABLE_INSTALL_PATH" -v | cut -d ' ' -f 3
