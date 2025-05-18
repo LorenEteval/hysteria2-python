@@ -70,15 +70,16 @@ hysteria2-python works on all major platform with all Python version(Python 3).
 
 Below are tested build in [github actions](https://github.com/LorenEteval/hysteria2-python/actions).
 
-| Platform     | Python 3.7-Python 3.11 |
+| Platform     | Python 3.8-Python 3.13 |
 |--------------|:----------------------:|
-| ubuntu 20.04 |   :heavy_check_mark:   |
 | ubuntu 22.04 |   :heavy_check_mark:   |
+| ubuntu 24.04 |   :heavy_check_mark:   |
 | windows-2019 |   :heavy_check_mark:   |
 | windows-2022 |   :heavy_check_mark:   |
-| macos-11     |   :heavy_check_mark:   |
-| macos-12     |   :heavy_check_mark:   |
+| windows-2025 |   :heavy_check_mark:   |
 | macos-13     |   :heavy_check_mark:   |
+| macos-14     |   :heavy_check_mark:   |
+| macos-15     |   :heavy_check_mark:   |
 
 ## License
 
