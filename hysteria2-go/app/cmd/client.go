@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
@@ -97,10 +98,12 @@ type clientConfigObfs struct {
 }
 
 type clientConfigTLS struct {
-	SNI       string `mapstructure:"sni"`
-	Insecure  bool   `mapstructure:"insecure"`
-	PinSHA256 string `mapstructure:"pinSHA256"`
-	CA        string `mapstructure:"ca"`
+	SNI               string `mapstructure:"sni"`
+	Insecure          bool   `mapstructure:"insecure"`
+	PinSHA256         string `mapstructure:"pinSHA256"`
+	CA                string `mapstructure:"ca"`
+	ClientCertificate string `mapstructure:"clientCertificate"`
+	ClientKey         string `mapstructure:"clientKey"`
 }
 
 type clientConfigQUIC struct {
@@ -273,12 +276,11 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 	if c.TLS.PinSHA256 != "" {
 		nHash := normalizeCertHash(c.TLS.PinSHA256)
 		hyConfig.TLSConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			for _, cert := range rawCerts {
-				hash := sha256.Sum256(cert)
-				hashHex := hex.EncodeToString(hash[:])
-				if hashHex == nHash {
-					return nil
-				}
+			cert := rawCerts[0] // only check the end-entity cert hash in the chain of trust
+			hash := sha256.Sum256(cert)
+			hashHex := hex.EncodeToString(hash[:])
+			if hashHex == nHash {
+				return nil
 			}
 			// No match
 			return errors.New("no certificate matches the pinned hash")
@@ -294,6 +296,31 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 			return configError{Field: "tls.ca", Err: errors.New("failed to parse CA certificate")}
 		}
 		hyConfig.TLSConfig.RootCAs = cPool
+	}
+	if c.TLS.ClientCertificate != "" && c.TLS.ClientKey != "" {
+		certLoader := &utils.LocalCertificateLoader{
+			CertFile: c.TLS.ClientCertificate,
+			KeyFile:  c.TLS.ClientKey,
+		}
+		// Try loading the cert-key pair here to catch errors early
+		err := certLoader.InitializeCache()
+		if err != nil {
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				if pathErr.Path == c.TLS.ClientCertificate {
+					return configError{Field: "tls.clientCertificate", Err: pathErr}
+				}
+				if pathErr.Path == c.TLS.ClientKey {
+					return configError{Field: "tls.clientKey", Err: pathErr}
+				}
+			}
+			return configError{Field: "tls.clientCertificate", Err: err}
+		}
+		// Use GetClientCertificates so that users can update the cert without restarting the client.
+		hyConfig.TLSConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			// For simplicity, always respond with the configured client certs, regardless of server requests.
+			return certLoader.GetCertificate(nil)
+		}
 	}
 	return nil
 }
@@ -480,8 +507,10 @@ func StartFromJSON(json string) {
 	defer c.Close()
 
 	uri := config.URI()
-	logger.Info("use this URI to share your server", zap.String("uri", uri))
 	if showQR {
+		logger.Warn("--qr flag is deprecated and will be removed in future release, " +
+			"please use `share` subcommand to generate share URI and QR code")
+		logger.Info("use this URI to share your server", zap.String("uri", uri))
 		utils.PrintQR(uri)
 	}
 
