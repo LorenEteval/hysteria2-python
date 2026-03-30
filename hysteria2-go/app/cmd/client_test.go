@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/spf13/viper"
@@ -53,6 +54,10 @@ func TestClientConfig(t *testing.T) {
 				FirewallMark:        uint32Ref(1234),
 				FdControlUnixSocket: stringRef("test.sock"),
 			},
+		},
+		Congestion: clientConfigCongestion{
+			Type:       "bbr",
+			BBRProfile: "aggressive",
 		},
 		Bandwidth: clientConfigBandwidth{
 			Up:   "200 mbps",
@@ -195,6 +200,88 @@ func TestClientConfigURI(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClientFillCongestionConfig(t *testing.T) {
+	t.Run("defaults to bbr standard", func(t *testing.T) {
+		hyConfig := &client.Config{}
+		err := (&clientConfig{}).fillCongestionConfig(hyConfig)
+		assert.NoError(t, err)
+		assert.Equal(t, "bbr", hyConfig.CongestionConfig.Type)
+		assert.Equal(t, "standard", hyConfig.CongestionConfig.BBRProfile)
+	})
+
+	t.Run("reno ignores bbr profile", func(t *testing.T) {
+		hyConfig := &client.Config{}
+		err := (&clientConfig{
+			Congestion: clientConfigCongestion{
+				Type:       "reno",
+				BBRProfile: "definitely-invalid",
+			},
+		}).fillCongestionConfig(hyConfig)
+		assert.NoError(t, err)
+		assert.Equal(t, "reno", hyConfig.CongestionConfig.Type)
+		assert.Empty(t, hyConfig.CongestionConfig.BBRProfile)
+	})
+
+	t.Run("rejects invalid type", func(t *testing.T) {
+		err := (&clientConfig{
+			Congestion: clientConfigCongestion{Type: "cubic"},
+		}).fillCongestionConfig(&client.Config{})
+		assert.EqualError(t, err, `invalid config: congestion.type: unsupported congestion type "cubic"`)
+	})
+
+	t.Run("rejects invalid bbr profile", func(t *testing.T) {
+		err := (&clientConfig{
+			Congestion: clientConfigCongestion{
+				Type:       "bbr",
+				BBRProfile: "turbo",
+			},
+		}).fillCongestionConfig(&client.Config{})
+		assert.EqualError(t, err, `invalid config: congestion.bbrProfile: unsupported BBR profile "turbo"`)
+	})
+}
+
+func TestClientTransportUDPHopIntervalConfig(t *testing.T) {
+	t.Run("fixed interval", func(t *testing.T) {
+		cfg, err := (clientConfigTransportUDP{HopInterval: 30 * time.Second}).hopIntervalConfig()
+		assert.NoError(t, err)
+		assert.Equal(t, 30*time.Second, cfg.Min)
+		assert.Equal(t, 30*time.Second, cfg.Max)
+	})
+
+	t.Run("range interval", func(t *testing.T) {
+		cfg, err := (clientConfigTransportUDP{
+			MinHopInterval: 10 * time.Second,
+			MaxHopInterval: 30 * time.Second,
+		}).hopIntervalConfig()
+		assert.NoError(t, err)
+		assert.Equal(t, 10*time.Second, cfg.Min)
+		assert.Equal(t, 30*time.Second, cfg.Max)
+	})
+
+	t.Run("default interval", func(t *testing.T) {
+		cfg, err := (clientConfigTransportUDP{}).hopIntervalConfig()
+		assert.NoError(t, err)
+		assert.Zero(t, cfg.Min)
+		assert.Zero(t, cfg.Max)
+	})
+
+	t.Run("rejects mixed fields", func(t *testing.T) {
+		_, err := (clientConfigTransportUDP{
+			HopInterval:    30 * time.Second,
+			MinHopInterval: 10 * time.Second,
+			MaxHopInterval: 30 * time.Second,
+		}).hopIntervalConfig()
+		assert.EqualError(t, err, "hopInterval cannot be used together with minHopInterval or maxHopInterval")
+	})
+
+	t.Run("rejects partial range", func(t *testing.T) {
+		_, err := (clientConfigTransportUDP{
+			MinHopInterval: 10 * time.Second,
+		}).hopIntervalConfig()
+		assert.EqualError(t, err, "minHopInterval and maxHopInterval must both be set")
+	})
 }
 
 func stringRef(s string) *string {

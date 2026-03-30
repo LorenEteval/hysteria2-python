@@ -60,27 +60,30 @@ func initClientFlags() {
 }
 
 type clientConfig struct {
-	Server        string                `mapstructure:"server"`
-	Auth          string                `mapstructure:"auth"`
-	Transport     clientConfigTransport `mapstructure:"transport"`
-	Obfs          clientConfigObfs      `mapstructure:"obfs"`
-	TLS           clientConfigTLS       `mapstructure:"tls"`
-	QUIC          clientConfigQUIC      `mapstructure:"quic"`
-	Bandwidth     clientConfigBandwidth `mapstructure:"bandwidth"`
-	FastOpen      bool                  `mapstructure:"fastOpen"`
-	Lazy          bool                  `mapstructure:"lazy"`
-	SOCKS5        *socks5Config         `mapstructure:"socks5"`
-	HTTP          *httpConfig           `mapstructure:"http"`
-	TCPForwarding []tcpForwardingEntry  `mapstructure:"tcpForwarding"`
-	UDPForwarding []udpForwardingEntry  `mapstructure:"udpForwarding"`
-	TCPTProxy     *tcpTProxyConfig      `mapstructure:"tcpTProxy"`
-	UDPTProxy     *udpTProxyConfig      `mapstructure:"udpTProxy"`
-	TCPRedirect   *tcpRedirectConfig    `mapstructure:"tcpRedirect"`
-	TUN           *tunConfig            `mapstructure:"tun"`
+	Server        string                 `mapstructure:"server"`
+	Auth          string                 `mapstructure:"auth"`
+	Transport     clientConfigTransport  `mapstructure:"transport"`
+	Obfs          clientConfigObfs       `mapstructure:"obfs"`
+	TLS           clientConfigTLS        `mapstructure:"tls"`
+	QUIC          clientConfigQUIC       `mapstructure:"quic"`
+	Congestion    clientConfigCongestion `mapstructure:"congestion"`
+	Bandwidth     clientConfigBandwidth  `mapstructure:"bandwidth"`
+	FastOpen      bool                   `mapstructure:"fastOpen"`
+	Lazy          bool                   `mapstructure:"lazy"`
+	SOCKS5        *socks5Config          `mapstructure:"socks5"`
+	HTTP          *httpConfig            `mapstructure:"http"`
+	TCPForwarding []tcpForwardingEntry   `mapstructure:"tcpForwarding"`
+	UDPForwarding []udpForwardingEntry   `mapstructure:"udpForwarding"`
+	TCPTProxy     *tcpTProxyConfig       `mapstructure:"tcpTProxy"`
+	UDPTProxy     *udpTProxyConfig       `mapstructure:"udpTProxy"`
+	TCPRedirect   *tcpRedirectConfig     `mapstructure:"tcpRedirect"`
+	TUN           *tunConfig             `mapstructure:"tun"`
 }
 
 type clientConfigTransportUDP struct {
-	HopInterval time.Duration `mapstructure:"hopInterval"`
+	HopInterval    time.Duration `mapstructure:"hopInterval"`
+	MinHopInterval time.Duration `mapstructure:"minHopInterval"`
+	MaxHopInterval time.Duration `mapstructure:"maxHopInterval"`
 }
 
 type clientConfigTransport struct {
@@ -126,6 +129,11 @@ type clientConfigQUICSockopts struct {
 type clientConfigBandwidth struct {
 	Up   string `mapstructure:"up"`
 	Down string `mapstructure:"down"`
+}
+
+type clientConfigCongestion struct {
+	Type       string `mapstructure:"type"`
+	BBRProfile string `mapstructure:"bbrProfile"`
 }
 
 type socks5Config struct {
@@ -227,12 +235,16 @@ func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
 	}
 	// Inner PacketConn
 	var newFunc func(addr net.Addr) (net.PacketConn, error)
+	hopInterval, err := c.Transport.UDP.hopIntervalConfig()
+	if err != nil {
+		return configError{Field: "transport.udp", Err: err}
+	}
 	switch strings.ToLower(c.Transport.Type) {
 	case "", "udp":
 		if hyConfig.ServerAddr.Network() == "udphop" {
 			hopAddr := hyConfig.ServerAddr.(*udphop.UDPHopAddr)
 			newFunc = func(addr net.Addr) (net.PacketConn, error) {
-				return udphop.NewUDPHopPacketConn(hopAddr, c.Transport.UDP.HopInterval, so.ListenUDP)
+				return udphop.NewUDPHopPacketConn(hopAddr, hopInterval, so.ListenUDP)
 			}
 		} else {
 			newFunc = func(addr net.Addr) (net.PacketConn, error) {
@@ -244,7 +256,6 @@ func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
 	}
 	// Obfuscation
 	var ob obfs.Obfuscator
-	var err error
 	switch strings.ToLower(c.Obfs.Type) {
 	case "", "plain":
 		// Keep it nil
@@ -261,6 +272,25 @@ func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
 		Obfuscator: ob,
 	}
 	return nil
+}
+
+func (c clientConfigTransportUDP) hopIntervalConfig() (udphop.HopIntervalConfig, error) {
+	if c.HopInterval != 0 && (c.MinHopInterval != 0 || c.MaxHopInterval != 0) {
+		return udphop.HopIntervalConfig{}, errors.New("hopInterval cannot be used together with minHopInterval or maxHopInterval")
+	}
+	if c.MinHopInterval == 0 && c.MaxHopInterval == 0 {
+		if c.HopInterval == 0 {
+			return udphop.HopIntervalConfig{}, nil
+		}
+		return udphop.HopIntervalConfig{Min: c.HopInterval, Max: c.HopInterval}, nil
+	}
+	if c.MinHopInterval == 0 || c.MaxHopInterval == 0 {
+		return udphop.HopIntervalConfig{}, errors.New("minHopInterval and maxHopInterval must both be set")
+	}
+	return udphop.HopIntervalConfig{
+		Min: c.MinHopInterval,
+		Max: c.MaxHopInterval,
+	}, nil
 }
 
 func (c *clientConfig) fillAuth(hyConfig *client.Config) error {
@@ -352,6 +382,22 @@ func (c *clientConfig) fillBandwidthConfig(hyConfig *client.Config) error {
 		if err != nil {
 			return configError{Field: "bandwidth.down", Err: err}
 		}
+	}
+	return nil
+}
+
+func (c *clientConfig) fillCongestionConfig(hyConfig *client.Config) error {
+	normalizedType, err := normalizeCongestionType(c.Congestion.Type)
+	if err != nil {
+		return configError{Field: "congestion.type", Err: err}
+	}
+	hyConfig.CongestionConfig.Type = normalizedType
+	if normalizedType == congestionTypeBBR {
+		normalizedProfile, err := normalizeBBRProfile(c.Congestion.BBRProfile)
+		if err != nil {
+			return configError{Field: "congestion.bbrProfile", Err: err}
+		}
+		hyConfig.CongestionConfig.BBRProfile = normalizedProfile
 	}
 	return nil
 }
@@ -458,6 +504,7 @@ func (c *clientConfig) Config() (*client.Config, error) {
 		c.fillAuth,
 		c.fillTLSConfig,
 		c.fillQUICConfig,
+		c.fillCongestionConfig,
 		c.fillBandwidthConfig,
 		c.fillFastOpen,
 	}
