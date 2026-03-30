@@ -22,6 +22,7 @@ var (
 	skipDownload bool
 	skipUpload   bool
 	dataSize     uint32
+	testDuration time.Duration
 	useBytes     bool
 
 	speedtestAddr = fmt.Sprintf("%s:%d", outbounds.SpeedtestDest, 0)
@@ -32,7 +33,7 @@ var speedtestCmd = &cobra.Command{
 	Use:   "speedtest",
 	Short: "Speed test mode",
 	Long:  "Perform a speed test through the proxy server. The server must have speed test support enabled.",
-	Run:   runSpeedtest,
+	Run:   runSpeedtestCmd,
 }
 
 func init() {
@@ -43,18 +44,23 @@ func init() {
 func initSpeedtestFlags() {
 	speedtestCmd.Flags().BoolVar(&skipDownload, "skip-download", false, "Skip download test")
 	speedtestCmd.Flags().BoolVar(&skipUpload, "skip-upload", false, "Skip upload test")
-	speedtestCmd.Flags().Uint32Var(&dataSize, "data-size", 1024*1024*100, "Data size for download and upload tests")
+	speedtestCmd.Flags().DurationVar(&testDuration, "duration", 10*time.Second, "Duration for each direction in time-based mode")
+	speedtestCmd.Flags().Uint32Var(&dataSize, "data-size", 0, "Data size in bytes (switches to size-based mode when set)")
 	speedtestCmd.Flags().BoolVar(&useBytes, "use-bytes", false, "Use bytes per second instead of bits per second")
 }
 
-func runSpeedtest(cmd *cobra.Command, args []string) {
+func runSpeedtestCmd(cmd *cobra.Command, args []string) {
 	logger.Info("speed test mode")
+	sizeBased := cmd.Flags().Changed("data-size")
+	runSpeedtest(defaultViper, sizeBased)
+}
 
-	if err := viper.ReadInConfig(); err != nil {
+func runSpeedtest(v *viper.Viper, sizeBased bool) {
+	if err := v.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read client config", zap.Error(err))
 	}
 	var config clientConfig
-	if err := viper.Unmarshal(&config); err != nil {
+	if err := v.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
 	hyConfig, err := config.Config()
@@ -78,10 +84,10 @@ func runSpeedtest(cmd *cobra.Command, args []string) {
 	runChan := make(chan struct{}, 1)
 	go func() {
 		if !skipDownload {
-			runDownloadTest(c)
+			runSingleTest(c, sizeBased, true)
 		}
 		if !skipUpload {
-			runUploadTest(c)
+			runSingleTest(c, sizeBased, false)
 		}
 		runChan <- struct{}{}
 	}()
@@ -94,9 +100,13 @@ func runSpeedtest(cmd *cobra.Command, args []string) {
 	}
 }
 
-func runDownloadTest(c client.Client) {
-	logger.Info("performing download test")
-	downConn, err := c.TCP(speedtestAddr)
+func runSingleTest(c client.Client, sizeBased, download bool) {
+	name := "upload"
+	if download {
+		name = "download"
+	}
+	logger.Info("performing " + name + " test")
+	conn, err := c.TCP(speedtestAddr)
 	if err != nil {
 		if errors.As(err, &hyErrors.DialError{}) {
 			logger.Fatal("failed to connect (server may not support speed test)", zap.Error(err))
@@ -104,63 +114,47 @@ func runDownloadTest(c client.Client) {
 			logger.Fatal("failed to connect", zap.Error(err))
 		}
 	}
-	defer downConn.Close()
+	defer conn.Close()
 
-	downClient := &speedtest.Client{Conn: downConn}
-	currentTotal := uint32(0)
-	err = downClient.Download(dataSize, func(d time.Duration, b uint32, done bool) {
+	sc := &speedtest.Client{Conn: conn}
+	var currentTotal uint64
+	var elapsed time.Duration
+	dur := testDuration
+	if sizeBased {
+		dur = 0
+	}
+	cb := func(d time.Duration, b uint64, done bool) {
 		if !done {
 			currentTotal += b
-			logger.Info("downloading",
-				zap.Uint32("bytes", b),
-				zap.String("progress", fmt.Sprintf("%.2f%%", float64(currentTotal)/float64(dataSize)*100)),
+			elapsed += d
+			var progress float64
+			if sizeBased {
+				progress = float64(currentTotal) / float64(dataSize) * 100
+			} else {
+				progress = float64(elapsed) / float64(testDuration) * 100
+			}
+			logger.Info(name+"ing",
+				zap.Uint64("bytes", b),
+				zap.String("progress", fmt.Sprintf("%.2f%%", progress)),
 				zap.String("speed", formatSpeed(b, d, useBytes)))
 		} else {
-			logger.Info("download complete",
-				zap.Uint32("bytes", b),
+			logger.Info(name+" complete",
+				zap.Uint64("bytes", b),
 				zap.String("speed", formatSpeed(b, d, useBytes)))
 		}
-	})
-	if err != nil {
-		logger.Fatal("download test failed", zap.Error(err))
 	}
-	logger.Info("download test complete")
+	if download {
+		err = sc.Download(dataSize, dur, cb)
+	} else {
+		err = sc.Upload(dataSize, dur, cb)
+	}
+	if err != nil {
+		logger.Fatal(name+" test failed", zap.Error(err))
+	}
+	logger.Info(name + " test complete")
 }
 
-func runUploadTest(c client.Client) {
-	logger.Info("performing upload test")
-	upConn, err := c.TCP(speedtestAddr)
-	if err != nil {
-		if errors.As(err, &hyErrors.DialError{}) {
-			logger.Fatal("failed to connect (server may not support speed test)", zap.Error(err))
-		} else {
-			logger.Fatal("failed to connect", zap.Error(err))
-		}
-	}
-	defer upConn.Close()
-
-	upClient := &speedtest.Client{Conn: upConn}
-	currentTotal := uint32(0)
-	err = upClient.Upload(dataSize, func(d time.Duration, b uint32, done bool) {
-		if !done {
-			currentTotal += b
-			logger.Info("uploading",
-				zap.Uint32("bytes", b),
-				zap.String("progress", fmt.Sprintf("%.2f%%", float64(currentTotal)/float64(dataSize)*100)),
-				zap.String("speed", formatSpeed(b, d, useBytes)))
-		} else {
-			logger.Info("upload complete",
-				zap.Uint32("bytes", b),
-				zap.String("speed", formatSpeed(b, d, useBytes)))
-		}
-	})
-	if err != nil {
-		logger.Fatal("upload test failed", zap.Error(err))
-	}
-	logger.Info("upload test complete")
-}
-
-func formatSpeed(bytes uint32, duration time.Duration, useBytes bool) string {
+func formatSpeed(bytes uint64, duration time.Duration, useBytes bool) string {
 	speed := float64(bytes) / duration.Seconds()
 	var units []string
 	if useBytes {
