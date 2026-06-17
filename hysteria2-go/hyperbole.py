@@ -267,6 +267,12 @@ def cmd_build(pprof=False, release=False, race=False):
         plat_ldflags.append(APP_SRC_CMD_PKG + ".appPlatform=" + os_name)
         plat_ldflags.append("-X")
         plat_ldflags.append(APP_SRC_CMD_PKG + ".appArch=" + arch)
+        if os_name == "android":
+            # github.com/wlynxg/anet uses //go:linkname to reach internal net
+            # symbols (net.zoneCache), which Go 1.23+ rejects unless the
+            # linker is told to skip the check. Without this the Android
+            # build fails with: "link: ... invalid reference to net.zoneCache".
+            plat_ldflags.append("-checklinkname=0")
 
         cmd = [
             "go",
@@ -354,6 +360,25 @@ def cmd_format():
         subprocess.check_call(["gofumpt", "-w", "-l", "-extra", "."])
     except Exception:
         print("Failed to format code")
+
+
+def cmd_format_check():
+    if not check_command(["gofumpt", "-version"]):
+        print("gofumpt is not installed. Please install gofumpt and try again.")
+        sys.exit(1)
+
+    try:
+        output = (
+            subprocess.check_output(["gofumpt", "-l", "-extra", "."]).decode().strip()
+        )
+    except Exception:
+        print("Failed to check code format")
+        sys.exit(1)
+
+    if output:
+        print("The following files are not properly formatted:")
+        print(output)
+        sys.exit(1)
 
 
 def cmd_mockgen():
@@ -500,6 +525,9 @@ def main():
     # Format
     p_cmd.add_parser("format", help="Format the code")
 
+    # Format check
+    p_cmd.add_parser("format-check", help="Check code format")
+
     # Mockgen
     p_cmd.add_parser("mockgen", help="Generate mock interfaces")
 
@@ -533,6 +561,8 @@ def main():
         cmd_build(args.pprof, args.release, args.race)
     elif args.command == "format":
         cmd_format()
+    elif args.command == "format-check":
+        cmd_format_check()
     elif args.command == "mockgen":
         cmd_mockgen()
     elif args.command == "protogen":

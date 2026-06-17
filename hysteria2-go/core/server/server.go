@@ -58,11 +58,13 @@ func NewServer(config *Config) (Server, error) {
 		DisablePathMTUDiscovery:        config.QUICConfig.DisablePathMTUDiscovery,
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
+		AssumePeerMaxDatagramFrameSize: protocol.MaxDatagramFrameSize,
 		DisablePathManager:             true,
 	}
-	listener, err := quic.Listen(config.Conn, tlsConfig, quicConfig)
+	tr := &quic.Transport{Conn: config.Conn}
+	listener, err := tr.Listen(tlsConfig, quicConfig)
 	if err != nil {
-		err = errors.Join(err, config.Conn.Close())
+		err = errors.Join(err, tr.Close(), config.Conn.Close())
 		if config.Cleanup != nil {
 			err = errors.Join(err, config.Cleanup.Close())
 		}
@@ -70,12 +72,14 @@ func NewServer(config *Config) (Server, error) {
 	}
 	return &serverImpl{
 		config:   config,
+		tr:       tr,
 		listener: listener,
 	}, nil
 }
 
 type serverImpl struct {
 	config   *Config
+	tr       *quic.Transport
 	listener *quic.Listener
 }
 
@@ -90,7 +94,7 @@ func (s *serverImpl) Serve() error {
 }
 
 func (s *serverImpl) Close() error {
-	err := errors.Join(s.listener.Close(), s.config.Conn.Close())
+	err := errors.Join(s.listener.Close(), s.tr.Close(), s.config.Conn.Close())
 	if s.config.Cleanup != nil {
 		err = errors.Join(err, s.config.Cleanup.Close())
 	}
@@ -197,7 +201,8 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					sm := newUDPSessionManager(
 						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
-						h.config.UDPIdleTimeout)
+						h.config.UDPIdleTimeout,
+					)
 					h.udpSM = sm
 					go sm.Run()
 				}()
@@ -391,6 +396,10 @@ func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
 
 func (io *udpIOImpl) UDP(reqAddr string) (UDPConn, error) {
 	return io.Outbound.UDP(reqAddr)
+}
+
+func (io *udpIOImpl) CheckUDP(reqAddr string) error {
+	return io.Outbound.CheckUDP(reqAddr)
 }
 
 type udpEventLoggerImpl struct {

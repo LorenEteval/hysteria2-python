@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	stdHTTP "net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -16,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,8 +39,16 @@ import (
 	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/obfs"
+	"github.com/apernet/hysteria/extras/v2/realm"
 	"github.com/apernet/hysteria/extras/v2/transport/udphop"
 )
+
+// Ref: https://ip.skk.moe/stun
+var defaultRealmSTUNServers = []string{
+	"stun.nextcloud.com:3478",
+	"stun.sip.us:3478",
+	"global.stun.twilio.com:3478",
+}
 
 // Client flags
 var (
@@ -62,6 +73,7 @@ func initClientFlags() {
 type clientConfig struct {
 	Server        string                 `mapstructure:"server"`
 	Auth          string                 `mapstructure:"auth"`
+	Realm         clientConfigRealm      `mapstructure:"realm"`
 	Transport     clientConfigTransport  `mapstructure:"transport"`
 	Obfs          clientConfigObfs       `mapstructure:"obfs"`
 	TLS           clientConfigTLS        `mapstructure:"tls"`
@@ -80,6 +92,13 @@ type clientConfig struct {
 	TUN           *tunConfig             `mapstructure:"tun"`
 }
 
+type clientConfigRealm struct {
+	STUNServers  []string      `mapstructure:"stunServers"`
+	STUNTimeout  time.Duration `mapstructure:"stunTimeout"`
+	PunchTimeout time.Duration `mapstructure:"punchTimeout"`
+	Insecure     bool          `mapstructure:"insecure"`
+}
+
 type clientConfigTransportUDP struct {
 	HopInterval    time.Duration `mapstructure:"hopInterval"`
 	MinHopInterval time.Duration `mapstructure:"minHopInterval"`
@@ -95,9 +114,16 @@ type clientConfigObfsSalamander struct {
 	Password string `mapstructure:"password"`
 }
 
+type clientConfigObfsGecko struct {
+	Password      string `mapstructure:"password"`
+	MinPacketSize int    `mapstructure:"minPacketSize"`
+	MaxPacketSize int    `mapstructure:"maxPacketSize"`
+}
+
 type clientConfigObfs struct {
 	Type       string                     `mapstructure:"type"`
 	Salamander clientConfigObfsSalamander `mapstructure:"salamander"`
+	Gecko      clientConfigObfsGecko      `mapstructure:"gecko"`
 }
 
 type clientConfigTLS struct {
@@ -215,9 +241,51 @@ func (c *clientConfig) fillServerAddr(hyConfig *client.Config) error {
 	return nil
 }
 
-// fillConnFactory must be called after fillServerAddr, as we have different logic
-// for ConnFactory depending on whether we have a port hopping address.
+// fillConnFactory must be called after fillServerAddr, since the right kind
+// of inner conn (plain vs port-hopping) depends on the resolved server addr.
 func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
+	so, err := c.socketOptions()
+	if err != nil {
+		return err
+	}
+	hopInterval, err := c.Transport.UDP.hopIntervalConfig()
+	if err != nil {
+		return configError{Field: "transport.udp", Err: err}
+	}
+	var openInner func() (net.PacketConn, error)
+	switch strings.ToLower(c.Transport.Type) {
+	case "", "udp":
+		if hyConfig.ServerAddr.Network() == "udphop" {
+			hopAddr := hyConfig.ServerAddr.(*udphop.UDPHopAddr)
+			openInner = func() (net.PacketConn, error) {
+				return udphop.NewUDPHopPacketConn(hopAddr, hopInterval, so.ListenUDP)
+			}
+		} else {
+			openInner = func() (net.PacketConn, error) {
+				return so.ListenUDP()
+			}
+		}
+	default:
+		return configError{Field: "transport.type", Err: errors.New("unsupported transport type")}
+	}
+	hyConfig.ConnFactory = &singleUseConnFactory{
+		Open: func() (net.PacketConn, error) {
+			conn, err := openInner()
+			if err != nil {
+				return nil, err
+			}
+			wrapped, err := c.wrapObfs(conn)
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return wrapped, nil
+		},
+	}
+	return nil
+}
+
+func (c *clientConfig) socketOptions() (*sockopts.SocketOptions, error) {
 	so := &sockopts.SocketOptions{
 		BindInterface:       c.QUIC.Sockopts.BindInterface,
 		FirewallMark:        c.QUIC.Sockopts.FirewallMark,
@@ -226,52 +294,39 @@ func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
 	if err := so.CheckSupported(); err != nil {
 		var unsupportedErr *sockopts.UnsupportedError
 		if errors.As(err, &unsupportedErr) {
-			return configError{
+			return nil, configError{
 				Field: "quic.sockopts." + unsupportedErr.Field,
 				Err:   errors.New("unsupported on this platform"),
 			}
 		}
-		return configError{Field: "quic.sockopts", Err: err}
+		return nil, configError{Field: "quic.sockopts", Err: err}
 	}
-	// Inner PacketConn
-	var newFunc func(addr net.Addr) (net.PacketConn, error)
-	hopInterval, err := c.Transport.UDP.hopIntervalConfig()
-	if err != nil {
-		return configError{Field: "transport.udp", Err: err}
-	}
-	switch strings.ToLower(c.Transport.Type) {
-	case "", "udp":
-		if hyConfig.ServerAddr.Network() == "udphop" {
-			hopAddr := hyConfig.ServerAddr.(*udphop.UDPHopAddr)
-			newFunc = func(addr net.Addr) (net.PacketConn, error) {
-				return udphop.NewUDPHopPacketConn(hopAddr, hopInterval, so.ListenUDP)
-			}
-		} else {
-			newFunc = func(addr net.Addr) (net.PacketConn, error) {
-				return so.ListenUDP()
-			}
-		}
-	default:
-		return configError{Field: "transport.type", Err: errors.New("unsupported transport type")}
-	}
-	// Obfuscation
-	var ob obfs.Obfuscator
+	return so, nil
+}
+
+func (c *clientConfig) wrapObfs(conn net.PacketConn) (net.PacketConn, error) {
 	switch strings.ToLower(c.Obfs.Type) {
 	case "", "plain":
-		// Keep it nil
+		return conn, nil
 	case "salamander":
-		ob, err = obfs.NewSalamanderObfuscator([]byte(c.Obfs.Salamander.Password))
+		wrapped, err := obfs.WrapPacketConnSalamander(conn, []byte(c.Obfs.Salamander.Password))
 		if err != nil {
-			return configError{Field: "obfs.salamander.password", Err: err}
+			return nil, configError{Field: "obfs.salamander.password", Err: err}
 		}
+		return wrapped, nil
+	case "gecko":
+		wrapped, err := obfs.WrapPacketConnGecko(conn, obfs.GeckoOptions{
+			Password:      []byte(c.Obfs.Gecko.Password),
+			MinPacketSize: c.Obfs.Gecko.MinPacketSize,
+			MaxPacketSize: c.Obfs.Gecko.MaxPacketSize,
+		})
+		if err != nil {
+			return nil, configError{Field: "obfs.gecko", Err: err}
+		}
+		return wrapped, nil
 	default:
-		return configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
+		return nil, configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 	}
-	hyConfig.ConnFactory = &adaptiveConnFactory{
-		NewFunc:    newFunc,
-		Obfuscator: ob,
-	}
-	return nil
 }
 
 func (c clientConfigTransportUDP) hopIntervalConfig() (udphop.HopIntervalConfig, error) {
@@ -423,6 +478,9 @@ func (c *clientConfig) URI() string {
 	case "salamander":
 		q.Set("obfs", "salamander")
 		q.Set("obfs-password", c.Obfs.Salamander.Password)
+	case "gecko":
+		q.Set("obfs", "gecko")
+		q.Set("obfs-password", c.Obfs.Gecko.Password)
 	}
 	if c.TLS.SNI != "" {
 		q.Set("sni", c.TLS.SNI)
@@ -480,6 +538,8 @@ func (c *clientConfig) parseURI() bool {
 		switch strings.ToLower(obfsType) {
 		case "salamander":
 			c.Obfs.Salamander.Password = q.Get("obfs-password")
+		case "gecko":
+			c.Obfs.Gecko.Password = q.Get("obfs-password")
 		}
 	}
 	if sni := q.Get("sni"); sni != "" {
@@ -496,6 +556,12 @@ func (c *clientConfig) parseURI() bool {
 
 // Config validates the fields and returns a ready-to-use Hysteria client config
 func (c *clientConfig) Config() (*client.Config, error) {
+	if realmAddr, ok, err := c.parseRealmAddr(); ok || err != nil {
+		if err != nil {
+			return nil, configError{Field: "server", Err: err}
+		}
+		return c.realmConfig(realmAddr)
+	}
 	c.parseURI()
 	hyConfig := &client.Config{}
 	fillers := []func(*client.Config) error{
@@ -516,6 +582,161 @@ func (c *clientConfig) Config() (*client.Config, error) {
 	return hyConfig, nil
 }
 
+func (c *clientConfig) parseRealmAddr() (*realm.Addr, bool, error) {
+	addr, err := realm.ParseAddr(c.Server)
+	if err == nil {
+		return addr, true, nil
+	}
+	if strings.HasPrefix(c.Server, realm.SchemeHTTPS+":") || strings.HasPrefix(c.Server, realm.SchemeHTTP+":") {
+		return nil, true, err
+	}
+	return nil, false, nil
+}
+
+func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
+	logger.Debug("realm client mode detected",
+		zap.String("realm", addr.RealmID),
+		zap.String("realmServer", addr.HostPort),
+		zap.String("scheme", addr.RendezvousScheme))
+	hyConfig := &client.Config{}
+	fillers := []func(*client.Config) error{
+		c.fillAuth,
+		c.fillTLSConfig,
+		c.fillQUICConfig,
+		c.fillCongestionConfig,
+		c.fillBandwidthConfig,
+		c.fillFastOpen,
+	}
+	for _, f := range fillers {
+		if err := f(hyConfig); err != nil {
+			return nil, err
+		}
+	}
+	if c.TLS.SNI == "" {
+		hyConfig.TLSConfig.ServerName = addr.Host
+	}
+
+	so, err := c.socketOptions()
+	if err != nil {
+		return nil, err
+	}
+	var listenAddr *net.UDPAddr
+	if addr.LocalPort != 0 {
+		listenAddr = &net.UDPAddr{Port: addr.LocalPort}
+	}
+	baseConn, err := so.ListenUDPAddr(listenAddr)
+	if err != nil {
+		return nil, configError{Field: "realm", Err: err}
+	}
+	logger.Debug("realm client UDP socket opened",
+		zap.String("realm", addr.RealmID),
+		zap.String("local", baseConn.LocalAddr().String()))
+	success := false
+	defer func() {
+		if !success {
+			_ = baseConn.Close()
+		}
+	}()
+
+	ctx := context.Background()
+	stunServers := c.realmSTUNServers(addr)
+	logger.Debug("realm client STUN discovery started",
+		zap.String("realm", addr.RealmID),
+		zap.Strings("stunServers", stunServers))
+	stunStart := time.Now()
+	localAddrs, err := realm.Discover(ctx, baseConn, realm.STUNConfig{
+		Servers: stunServers,
+		Timeout: c.Realm.STUNTimeout,
+	})
+	if err != nil {
+		return nil, configError{Field: "realm.stun", Err: err}
+	}
+	logger.Debug("realm client STUN discovery completed",
+		zap.String("realm", addr.RealmID),
+		zap.Strings("addresses", addrPortStrings(localAddrs)),
+		zap.String("duration", formatLogDuration(time.Since(stunStart))))
+	meta, err := realm.NewPunchMetadata()
+	if err != nil {
+		return nil, configError{Field: "realm", Err: err}
+	}
+	attempt := shortAttempt(meta.Nonce)
+	rClient, err := realm.NewClientFromAddr(addr, c.realmHTTPClient())
+	if err != nil {
+		return nil, configError{Field: "realm", Err: err}
+	}
+	logger.Debug("realm client connect request started",
+		zap.String("realm", addr.RealmID),
+		zap.String("attempt", attempt),
+		zap.Strings("addresses", addrPortStrings(localAddrs)))
+	connectStart := time.Now()
+	connectResp, err := rClient.Connect(ctx, addr.RealmID, realm.ConnectRequest{
+		Addresses:     addrPortStrings(localAddrs),
+		PunchMetadata: meta,
+	})
+	if err != nil {
+		return nil, configError{Field: "realm.connect", Err: err}
+	}
+	logger.Debug("realm client connect response received",
+		zap.String("realm", addr.RealmID),
+		zap.String("attempt", attempt),
+		zap.Strings("serverAddresses", connectResp.Addresses),
+		zap.String("duration", formatLogDuration(time.Since(connectStart))))
+	peerAddrs, err := parseAddrPorts(connectResp.Addresses)
+	if err != nil {
+		return nil, configError{Field: "realm.connect.addresses", Err: err}
+	}
+	logger.Debug("realm client punch started",
+		zap.String("realm", addr.RealmID),
+		zap.String("attempt", attempt),
+		zap.Strings("candidates", connectResp.Addresses))
+	punchStart := time.Now()
+	result, err := realm.Punch(ctx, baseConn, localAddrs, peerAddrs, connectResp.PunchMetadata, realm.PunchConfig{
+		Timeout: c.Realm.PunchTimeout,
+	})
+	if err != nil {
+		return nil, configError{Field: "realm.punch", Err: err}
+	}
+	logger.Debug("realm client punch completed",
+		zap.String("realm", addr.RealmID),
+		zap.String("attempt", attempt),
+		zap.String("peer", result.PeerAddr.String()),
+		zap.String("packet", punchPacketTypeString(result.Packet.Type)),
+		zap.String("duration", formatLogDuration(time.Since(punchStart))))
+	hyConfig.ServerAddr = udpAddrFromAddrPort(result.PeerAddr)
+	logger.Debug("realm client handing socket to QUIC",
+		zap.String("realm", addr.RealmID),
+		zap.String("peer", result.PeerAddr.String()))
+
+	finalConn, err := c.wrapObfs(baseConn)
+	if err != nil {
+		return nil, err
+	}
+	hyConfig.ConnFactory = &singleUseConnFactory{
+		Open: func() (net.PacketConn, error) { return finalConn, nil },
+	}
+	success = true
+	return hyConfig, nil
+}
+
+func (c *clientConfig) realmSTUNServers(addr *realm.Addr) []string {
+	if stunServers := addr.Params["stun"]; len(stunServers) > 0 {
+		return append([]string(nil), stunServers...)
+	}
+	if len(c.Realm.STUNServers) > 0 {
+		return append([]string(nil), c.Realm.STUNServers...)
+	}
+	return append([]string(nil), defaultRealmSTUNServers...)
+}
+
+func (c *clientConfig) realmHTTPClient() *stdHTTP.Client {
+	if !c.Realm.Insecure {
+		return nil
+	}
+	tr := stdHTTP.DefaultTransport.(*stdHTTP.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	return &stdHTTP.Client{Transport: tr}
+}
+
 func StartFromJSON(json string) {
 	// client mode
 	InitLogger()
@@ -524,14 +745,12 @@ func StartFromJSON(json string) {
 
 	if err := viper.ReadConfigJSON(bytes.NewReader([]byte(json))); err != nil {
 		logger.Error("failed to read client config", zap.Error(err))
-
 		// Xray-core: Configuration error
 		os.Exit(23)
 	}
 	var config clientConfig
 	if err := viper.Unmarshal(&config); err != nil {
 		logger.Error("failed to parse client config", zap.Error(err))
-
 		// Xray-core: Configuration error
 		os.Exit(23)
 	}
@@ -547,7 +766,8 @@ func StartFromJSON(json string) {
 			//if count == 1 && !disableUpdateCheck {
 			//	go runCheckUpdateClient(c)
 			//}
-		}, config.Lazy)
+		}, config.Lazy,
+	)
 	if err != nil {
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
@@ -655,7 +875,8 @@ func runClient(v *viper.Viper) {
 			if count == 1 && !disableUpdateCheck {
 				go runCheckUpdateClient(c)
 			}
-		}, config.Lazy)
+		}, config.Lazy,
+	)
 	if err != nil {
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
@@ -1052,25 +1273,81 @@ func normalizeCertHash(hash string) string {
 	return r
 }
 
-type adaptiveConnFactory struct {
-	NewFunc    func(addr net.Addr) (net.PacketConn, error)
-	Obfuscator obfs.Obfuscator // nil if no obfuscation
+// singleUseConnFactory invokes Open exactly once to produce the underlying
+// conn. It defers any allocation to the moment core/client.connect() actually
+// asks for the conn, so config-validation failures inside NewClient (e.g.
+// verifyAndFill rejecting a value) don't leak a socket. For the realm path
+// the conn is already open by the time we reach the factory, so Open just
+// returns it; for the regular path Open opens the UDP socket fresh.
+type singleUseConnFactory struct {
+	Open func() (net.PacketConn, error)
+
+	mu   sync.Mutex
+	used bool
 }
 
-func (f *adaptiveConnFactory) New(addr net.Addr) (net.PacketConn, error) {
-	if f.Obfuscator == nil {
-		return f.NewFunc(addr)
-	} else {
-		conn, err := f.NewFunc(addr)
+func (f *singleUseConnFactory) New(net.Addr) (net.PacketConn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.used {
+		return nil, errors.New("connection factory already used")
+	}
+	f.used = true
+	return f.Open()
+}
+
+func addrPortStrings(addrs []netip.AddrPort) []string {
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		out = append(out, addr.String())
+	}
+	return out
+}
+
+func parseAddrPorts(addrs []string) ([]netip.AddrPort, error) {
+	out := make([]netip.AddrPort, 0, len(addrs))
+	for _, s := range addrs {
+		addr, err := netip.ParseAddrPort(s)
 		if err != nil {
 			return nil, err
 		}
-		return obfs.WrapPacketConn(conn, f.Obfuscator), nil
+		out = append(out, addr)
 	}
+	return out, nil
+}
+
+func udpAddrFromAddrPort(addr netip.AddrPort) *net.UDPAddr {
+	return &net.UDPAddr{
+		IP:   net.IP(addr.Addr().AsSlice()),
+		Port: int(addr.Port()),
+	}
+}
+
+func shortAttempt(nonce string) string {
+	if len(nonce) <= 8 {
+		return nonce
+	}
+	return nonce[:8]
+}
+
+func punchPacketTypeString(t realm.PunchPacketType) string {
+	switch t {
+	case realm.PunchPacketHello:
+		return "hello"
+	case realm.PunchPacketAck:
+		return "ack"
+	default:
+		return "unknown"
+	}
+}
+
+func formatLogDuration(d time.Duration) string {
+	return d.Round(time.Millisecond).String()
 }
 
 func connectLog(info *client.HandshakeInfo, count int) {
 	logger.Info("connected to server",
+		zap.String("addr", info.ServerAddr.String()),
 		zap.Bool("udpEnabled", info.UDPEnabled),
 		zap.Uint64("tx", info.Tx),
 		zap.Int("count", count))
