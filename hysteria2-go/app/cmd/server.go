@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,7 @@ type serverConfig struct {
 	Obfs                  serverConfigObfs            `mapstructure:"obfs"`
 	TLS                   *serverConfigTLS            `mapstructure:"tls"`
 	ACME                  *serverConfigACME           `mapstructure:"acme"`
+	ECH                   *serverConfigECH            `mapstructure:"ech"`
 	QUIC                  serverConfigQUIC            `mapstructure:"quic"`
 	Congestion            serverConfigCongestion      `mapstructure:"congestion"`
 	Bandwidth             serverConfigBandwidth       `mapstructure:"bandwidth"`
@@ -86,11 +88,13 @@ type serverConfig struct {
 }
 
 type serverConfigRealm struct {
-	STUNServers       []string      `mapstructure:"stunServers"`
-	STUNTimeout       time.Duration `mapstructure:"stunTimeout"`
-	PunchTimeout      time.Duration `mapstructure:"punchTimeout"`
-	HeartbeatInterval time.Duration `mapstructure:"heartbeatInterval"`
-	Insecure          bool          `mapstructure:"insecure"`
+	STUNServers       []string               `mapstructure:"stunServers"`
+	STUNTimeout       time.Duration          `mapstructure:"stunTimeout"`
+	PunchTimeout      time.Duration          `mapstructure:"punchTimeout"`
+	HeartbeatInterval time.Duration          `mapstructure:"heartbeatInterval"`
+	Insecure          bool                   `mapstructure:"insecure"`
+	IPMode            string                 `mapstructure:"ipMode"`
+	PortMapping       realmPortMappingConfig `mapstructure:"portMapping"`
 }
 
 type serverConfigObfsSalamander struct {
@@ -114,6 +118,10 @@ type serverConfigTLS struct {
 	Key      string `mapstructure:"key"`
 	SNIGuard string `mapstructure:"sniGuard"` // "disable", "dns-san", "strict"
 	ClientCA string `mapstructure:"clientCA"`
+}
+
+type serverConfigECH struct {
+	KeyPath string `mapstructure:"keyPath"`
 }
 
 type serverConfigACME struct {
@@ -162,8 +170,9 @@ type serverConfigQUIC struct {
 }
 
 type serverConfigBandwidth struct {
-	Up   string `mapstructure:"up"`
-	Down string `mapstructure:"down"`
+	Up                      string `mapstructure:"up"`
+	Down                    string `mapstructure:"down"`
+	DisableLossCompensation bool   `mapstructure:"disableLossCompensation"`
 }
 
 type serverConfigCongestion struct {
@@ -348,11 +357,15 @@ func (c *serverConfig) fillRealmConn(hyConfig *server.Config, addr *realm.Addr) 
 		zap.String("realm", addr.RealmID),
 		zap.String("realmServer", addr.HostPort),
 		zap.String("scheme", addr.RendezvousScheme))
+	family, network, err := realmIPMode(c.Realm.IPMode)
+	if err != nil {
+		return configError{Field: "realm.ipMode", Err: err}
+	}
 	listenAddr := &net.UDPAddr{}
 	if addr.LocalPort != 0 {
 		listenAddr.Port = addr.LocalPort
 	}
-	conn, err := correctnet.ListenUDP("udp", listenAddr)
+	conn, err := correctnet.ListenUDP(network, listenAddr)
 	if err != nil {
 		return configError{Field: "listen", Err: err}
 	}
@@ -372,7 +385,7 @@ func (c *serverConfig) fillRealmConn(hyConfig *server.Config, addr *realm.Addr) 
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	runtime, err := c.startRealmServerRuntime(ctx, cancel, addr, punchConn)
+	runtime, err := c.startRealmServerRuntime(ctx, cancel, addr, punchConn, family)
 	if err != nil {
 		cancel()
 		_ = packetConn.Close()
@@ -427,7 +440,7 @@ func resolveServerListenAddr(listenAddr string) (*net.UDPAddr, eUtils.PortUnion,
 	return uAddr, portUnion, err
 }
 
-func (c *serverConfig) startRealmServerRuntime(ctx context.Context, cancel context.CancelFunc, addr *realm.Addr, punchConn *realm.PunchPacketConn) (*realmServerRuntime, error) {
+func (c *serverConfig) startRealmServerRuntime(ctx context.Context, cancel context.CancelFunc, addr *realm.Addr, punchConn *realm.PunchPacketConn, family realm.AddrFamily) (*realmServerRuntime, error) {
 	stunServers := c.realmSTUNServers(addr)
 	rClient, err := realm.NewClientFromAddr(addr, c.realmHTTPClient())
 	if err != nil {
@@ -445,15 +458,37 @@ func (c *serverConfig) startRealmServerRuntime(ctx context.Context, cancel conte
 		stunServers: stunServers,
 		puncher:     puncher,
 		config:      c.Realm,
+		family:      family,
+	}
+	// Gateway port mapping (UPnP/NAT-PMP) runs before STUN.
+	// With the pinhole in place, in a double-NAT setup,
+	// the address STUN observes corresponds to a path whose inner leg
+	// goes through the static mapping rather than a filtered dynamic one.
+	if c.Realm.PortMapping.Enabled {
+		localPort := 0
+		if udpAddr, ok := punchConn.LocalAddr().(*net.UDPAddr); ok {
+			localPort = udpAddr.Port
+		}
+		rt.mapper = newRealmPortMapper(ctx, addr.RealmID, localPort, c.Realm.PortMapping)
+	}
+	cleanupMapper := func() {
+		if rt.mapper != nil {
+			_ = rt.mapper.Close()
+		}
 	}
 	if _, _, err := rt.refreshAddrsDirect(ctx); err != nil {
+		cleanupMapper()
 		return nil, configError{Field: "realm.stun", Err: err}
 	}
 	initialSession, err := rt.register(ctx)
 	if err != nil {
+		cleanupMapper()
 		return nil, configError{Field: "realm.register", Err: err}
 	}
 	rt.setSession(initialSession)
+	if rt.mapper != nil {
+		go realmPortMapLoop(ctx, addr.RealmID, rt.mapper)
+	}
 	go rt.run(ctx, initialSession)
 	return rt, nil
 }
@@ -487,6 +522,8 @@ type realmServerRuntime struct {
 	stunServers []string
 	puncher     *realm.ServerPuncher
 	config      serverConfigRealm
+	family      realm.AddrFamily
+	mapper      *realm.PortMapper // nil if port mapping is disabled or failed
 
 	mu      sync.Mutex
 	session realmSession
@@ -708,11 +745,20 @@ func (r *realmServerRuntime) connectAddrs(ctx context.Context) ([]netip.AddrPort
 
 func (r *realmServerRuntime) cachedAddrs() []netip.AddrPort {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.addrs == nil || time.Since(r.addrsAt) >= realmConnectSTUNCacheTTL {
+		r.mu.Unlock()
 		return nil
 	}
-	return append([]netip.AddrPort(nil), r.addrs...)
+	addrs := append([]netip.AddrPort(nil), r.addrs...)
+	r.mu.Unlock()
+	return r.withMappedAddr(addrs)
+}
+
+func (r *realmServerRuntime) withMappedAddr(addrs []netip.AddrPort) []netip.AddrPort {
+	if r.mapper == nil {
+		return addrs
+	}
+	return mergeMappedAddr(addrs, r.mapper.ExternalAddr())
 }
 
 func (r *realmServerRuntime) respond(ctx context.Context, ev *realm.PunchEvent) {
@@ -750,6 +796,7 @@ func (r *realmServerRuntime) respond(ctx context.Context, ev *realm.PunchEvent) 
 	start := time.Now()
 	result, err := r.puncher.Respond(ctx, ev.Nonce, freshAddrs, peerAddrs, ev.PunchMetadata, realm.PunchConfig{
 		Timeout: r.config.PunchTimeout,
+		Family:  r.family,
 	})
 	if err != nil {
 		logger.Warn("realm punch failed", zap.String("realm", r.realmID), zap.String("attempt", attempt), zap.Error(err))
@@ -811,6 +858,7 @@ func (r *realmServerRuntime) refreshAddrsWith(ctx context.Context, discover func
 	addrs, err := discover(ctx, realm.STUNConfig{
 		Servers: r.stunServers,
 		Timeout: r.config.STUNTimeout,
+		Family:  r.family,
 	})
 	if err != nil {
 		return nil, false, err
@@ -828,13 +876,14 @@ func (r *realmServerRuntime) refreshAddrsWith(ctx context.Context, discover func
 		zap.Strings("addresses", addrPortStrings(current)),
 		zap.Bool("changed", changed),
 		zap.String("duration", formatLogDuration(time.Since(start))))
-	return current, changed, nil
+	return r.withMappedAddr(current), changed, nil
 }
 
 func (r *realmServerRuntime) currentAddrs() []netip.AddrPort {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]netip.AddrPort(nil), r.addrs...)
+	addrs := append([]netip.AddrPort(nil), r.addrs...)
+	r.mu.Unlock()
+	return r.withMappedAddr(addrs)
 }
 
 func sessionTTLDuration(ttl int) time.Duration {
@@ -1052,6 +1101,18 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			return configError{Field: "acme.domains", Err: err}
 		}
 		hyConfig.TLSConfig.GetCertificate = cmCfg.GetCertificate
+	}
+	if c.ECH != nil {
+		if c.ECH.KeyPath == "" {
+			return configError{Field: "ech.keyPath", Err: errors.New("empty ECH key path")}
+		}
+		keys, configList, err := utils.LoadECHKeys(c.ECH.KeyPath)
+		if err != nil {
+			return configError{Field: "ech.keyPath", Err: err}
+		}
+		hyConfig.TLSConfig.ECHKeys = keys
+		logger.Info("ECH enabled, set the following config list on clients (tls.ech)",
+			zap.String("configList", base64.StdEncoding.EncodeToString(configList)))
 	}
 	return nil
 }
@@ -1314,6 +1375,7 @@ func (c *serverConfig) fillBandwidthConfig(hyConfig *server.Config) error {
 			return configError{Field: "bandwidth.down", Err: err}
 		}
 	}
+	hyConfig.BandwidthConfig.DisableLossCompensation = c.Bandwidth.DisableLossCompensation
 	return nil
 }
 
@@ -1492,8 +1554,9 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 			HTTPSPort: extractPortFromAddr(c.Masquerade.ListenHTTPS),
 			Handler:   &masqHandlerLogWrapper{H: handler, QUIC: false},
 			TLSConfig: &tls.Config{
-				Certificates:   hyConfig.TLSConfig.Certificates,
-				GetCertificate: hyConfig.TLSConfig.GetCertificate,
+				Certificates:             hyConfig.TLSConfig.Certificates,
+				GetCertificate:           hyConfig.TLSConfig.GetCertificate,
+				EncryptedClientHelloKeys: hyConfig.TLSConfig.ECHKeys,
 			},
 			ForceHTTPS: c.Masquerade.ForceHTTPS,
 		}

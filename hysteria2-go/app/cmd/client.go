@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -93,10 +94,25 @@ type clientConfig struct {
 }
 
 type clientConfigRealm struct {
-	STUNServers  []string      `mapstructure:"stunServers"`
-	STUNTimeout  time.Duration `mapstructure:"stunTimeout"`
-	PunchTimeout time.Duration `mapstructure:"punchTimeout"`
-	Insecure     bool          `mapstructure:"insecure"`
+	STUNServers  []string               `mapstructure:"stunServers"`
+	STUNTimeout  time.Duration          `mapstructure:"stunTimeout"`
+	PunchTimeout time.Duration          `mapstructure:"punchTimeout"`
+	Insecure     bool                   `mapstructure:"insecure"`
+	IPMode       string                 `mapstructure:"ipMode"`
+	PortMapping  realmPortMappingConfig `mapstructure:"portMapping"`
+}
+
+func realmIPMode(mode string) (realm.AddrFamily, string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "dual":
+		return realm.AddrFamilyAny, "udp", nil
+	case "v4":
+		return realm.AddrFamilyIPv4, "udp4", nil
+	case "v6":
+		return realm.AddrFamilyIPv6, "udp6", nil
+	default:
+		return realm.AddrFamilyAny, "", fmt.Errorf("invalid ipMode %q (expected v4, v6, or dual)", mode)
+	}
 }
 
 type clientConfigTransportUDP struct {
@@ -133,6 +149,7 @@ type clientConfigTLS struct {
 	CA                string `mapstructure:"ca"`
 	ClientCertificate string `mapstructure:"clientCertificate"`
 	ClientKey         string `mapstructure:"clientKey"`
+	ECH               string `mapstructure:"ech"`
 }
 
 type clientConfigQUIC struct {
@@ -153,8 +170,9 @@ type clientConfigQUICSockopts struct {
 }
 
 type clientConfigBandwidth struct {
-	Up   string `mapstructure:"up"`
-	Down string `mapstructure:"down"`
+	Up                      string `mapstructure:"up"`
+	Down                    string `mapstructure:"down"`
+	DisableLossCompensation bool   `mapstructure:"disableLossCompensation"`
 }
 
 type clientConfigCongestion struct {
@@ -407,6 +425,13 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 			return certLoader.GetCertificate(nil)
 		}
 	}
+	if c.TLS.ECH != "" {
+		configList, err := utils.ParseECHConfigList(c.TLS.ECH)
+		if err != nil {
+			return configError{Field: "tls.ech", Err: err}
+		}
+		hyConfig.TLSConfig.ECHConfigList = configList
+	}
 	return nil
 }
 
@@ -438,6 +463,7 @@ func (c *clientConfig) fillBandwidthConfig(hyConfig *client.Config) error {
 			return configError{Field: "bandwidth.down", Err: err}
 		}
 	}
+	hyConfig.BandwidthConfig.DisableLossCompensation = c.Bandwidth.DisableLossCompensation
 	return nil
 }
 
@@ -491,6 +517,13 @@ func (c *clientConfig) URI() string {
 	if c.TLS.PinSHA256 != "" {
 		q.Set("pinSHA256", normalizeCertHash(c.TLS.PinSHA256))
 	}
+	if c.TLS.ECH != "" {
+		// Resolve to the raw config list so the URI is self-contained
+		// (the source may be a file path, which is not portable).
+		if configList, err := utils.ParseECHConfigList(c.TLS.ECH); err == nil {
+			q.Set("ech", base64.StdEncoding.EncodeToString(configList))
+		}
+	}
 	var user *url.Userinfo
 	if c.Auth != "" {
 		// We need to handle the special case of user:pass pairs
@@ -525,11 +558,13 @@ func (c *clientConfig) parseURI() bool {
 		return false
 	}
 	if u.User != nil {
-		auth, err := url.QueryUnescape(u.User.String())
-		if err != nil {
-			return false
+		username := u.User.Username()
+		password, hasPassword := u.User.Password()
+		if hasPassword {
+			c.Auth = username + ":" + password
+		} else {
+			c.Auth = username
 		}
-		c.Auth = auth
 	}
 	c.Server = u.Host
 	q := u.Query()
@@ -550,6 +585,9 @@ func (c *clientConfig) parseURI() bool {
 	}
 	if pinSHA256 := q.Get("pinSHA256"); pinSHA256 != "" {
 		c.TLS.PinSHA256 = pinSHA256
+	}
+	if ech := q.Get("ech"); ech != "" {
+		c.TLS.ECH = ech
 	}
 	return true
 }
@@ -615,7 +653,10 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 	if c.TLS.SNI == "" {
 		hyConfig.TLSConfig.ServerName = addr.Host
 	}
-
+	family, network, err := realmIPMode(c.Realm.IPMode)
+	if err != nil {
+		return nil, configError{Field: "realm.ipMode", Err: err}
+	}
 	so, err := c.socketOptions()
 	if err != nil {
 		return nil, err
@@ -624,7 +665,7 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 	if addr.LocalPort != 0 {
 		listenAddr = &net.UDPAddr{Port: addr.LocalPort}
 	}
-	baseConn, err := so.ListenUDPAddr(listenAddr)
+	baseConn, err := so.ListenUDPAddrNetwork(network, listenAddr)
 	if err != nil {
 		return nil, configError{Field: "realm", Err: err}
 	}
@@ -639,6 +680,22 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 	}()
 
 	ctx := context.Background()
+	// Gateway port mapping (UPnP/NAT-PMP) runs before STUN.
+	// With the pinhole in place, in a double-NAT setup,
+	// the address STUN observes corresponds to a path whose inner leg
+	// goes through the static mapping rather than a filtered dynamic one.
+	var mapper *realm.PortMapper
+	if c.Realm.PortMapping.Enabled {
+		localPort := baseConn.LocalAddr().(*net.UDPAddr).Port
+		mapper = newRealmPortMapper(ctx, addr.RealmID, localPort, c.Realm.PortMapping)
+		if mapper != nil {
+			defer func() {
+				if !success {
+					_ = mapper.Close()
+				}
+			}()
+		}
+	}
 	stunServers := c.realmSTUNServers(addr)
 	logger.Debug("realm client STUN discovery started",
 		zap.String("realm", addr.RealmID),
@@ -647,6 +704,7 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 	localAddrs, err := realm.Discover(ctx, baseConn, realm.STUNConfig{
 		Servers: stunServers,
 		Timeout: c.Realm.STUNTimeout,
+		Family:  family,
 	})
 	if err != nil {
 		return nil, configError{Field: "realm.stun", Err: err}
@@ -655,6 +713,9 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 		zap.String("realm", addr.RealmID),
 		zap.Strings("addresses", addrPortStrings(localAddrs)),
 		zap.String("duration", formatLogDuration(time.Since(stunStart))))
+	if mapper != nil {
+		localAddrs = mergeMappedAddr(localAddrs, mapper.ExternalAddr())
+	}
 	meta, err := realm.NewPunchMetadata()
 	if err != nil {
 		return nil, configError{Field: "realm", Err: err}
@@ -692,6 +753,7 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 	punchStart := time.Now()
 	result, err := realm.Punch(ctx, baseConn, localAddrs, peerAddrs, connectResp.PunchMetadata, realm.PunchConfig{
 		Timeout: c.Realm.PunchTimeout,
+		Family:  family,
 	})
 	if err != nil {
 		return nil, configError{Field: "realm.punch", Err: err}
@@ -710,6 +772,11 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 	finalConn, err := c.wrapObfs(baseConn)
 	if err != nil {
 		return nil, err
+	}
+	if mapper != nil {
+		mapCtx, mapCancel := context.WithCancel(context.Background())
+		go realmPortMapLoop(mapCtx, addr.RealmID, mapper)
+		finalConn = &cleanupPacketConn{PacketConn: finalConn, cleanup: mapCancel}
 	}
 	hyConfig.ConnFactory = &singleUseConnFactory{
 		Open: func() (net.PacketConn, error) { return finalConn, nil },
@@ -1350,6 +1417,7 @@ func connectLog(info *client.HandshakeInfo, count int) {
 		zap.String("addr", info.ServerAddr.String()),
 		zap.Bool("udpEnabled", info.UDPEnabled),
 		zap.Uint64("tx", info.Tx),
+		zap.Bool("ech", info.ECHAccepted),
 		zap.Int("count", count))
 }
 

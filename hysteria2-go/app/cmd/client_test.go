@@ -42,6 +42,7 @@ func TestClientConfig(t *testing.T) {
 			CA:                "custom_ca.crt",
 			ClientCertificate: "client.crt",
 			ClientKey:         "client.key",
+			ECH:               "AEv+DQBHAAAgACB3rc0Q",
 		},
 		QUIC: clientConfigQUIC{
 			InitStreamReceiveWindow:     1145141,
@@ -62,8 +63,9 @@ func TestClientConfig(t *testing.T) {
 			BBRProfile: "aggressive",
 		},
 		Bandwidth: clientConfigBandwidth{
-			Up:   "200 mbps",
-			Down: "1 gbps",
+			Up:                      "200 mbps",
+			Down:                    "1 gbps",
+			DisableLossCompensation: true,
 		},
 		FastOpen: true,
 		Lazy:     true,
@@ -159,7 +161,7 @@ func TestClientConfigURI(t *testing.T) {
 			},
 		},
 		{
-			uri:   "hysteria2://noauth.com/?insecure=1&obfs=salamander&obfs-password=66ccff&pinSHA256=deadbeef&sni=crap.cc",
+			uri:   "hysteria2://noauth.com/?ech=AAj%2BDQAEAAAAAA%3D%3D&insecure=1&obfs=salamander&obfs-password=66ccff&pinSHA256=deadbeef&sni=crap.cc",
 			uriOK: true,
 			config: &clientConfig{
 				Server: "noauth.com",
@@ -174,6 +176,7 @@ func TestClientConfigURI(t *testing.T) {
 					SNI:       "crap.cc",
 					Insecure:  true,
 					PinSHA256: "deadbeef",
+					ECH:       "AAj+DQAEAAAAAA==",
 				},
 			},
 		},

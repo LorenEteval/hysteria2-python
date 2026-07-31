@@ -118,6 +118,8 @@ type TLSConfig struct {
 	Certificates   []tls.Certificate
 	GetCertificate func(info *tls.ClientHelloInfo) (*tls.Certificate, error)
 	ClientCAs      *x509.CertPool
+	ECHKeys        []tls.EncryptedClientHelloKey
+	GetECHKeys     func(info *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error)
 }
 
 // QUICConfig contains the QUIC configuration fields that we want to expose to the user.
@@ -212,8 +214,9 @@ func (c *defaultUDPConn) WriteTo(b []byte, addr string) (int, error) {
 
 // BandwidthConfig describes the maximum bandwidth that the server can use, in bytes per second.
 type BandwidthConfig struct {
-	MaxTx uint64
-	MaxRx uint64
+	MaxTx                   uint64
+	MaxRx                   uint64
+	DisableLossCompensation bool
 }
 
 // Authenticator is an interface that provides authentication logic.

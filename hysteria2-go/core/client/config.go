@@ -107,6 +107,7 @@ type TLSConfig struct {
 	VerifyPeerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 	RootCAs               *x509.CertPool
 	GetClientCertificate  func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	ECHConfigList         []byte
 }
 
 // QUICConfig contains the QUIC configuration fields that we want to expose to the user.
@@ -127,6 +128,7 @@ type CongestionConfig struct {
 
 // BandwidthConfig describes the maximum bandwidth that the server can use, in bytes per second.
 type BandwidthConfig struct {
-	MaxTx uint64
-	MaxRx uint64
+	MaxTx                   uint64
+	MaxRx                   uint64
+	DisableLossCompensation bool
 }

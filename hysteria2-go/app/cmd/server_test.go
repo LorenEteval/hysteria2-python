@@ -36,6 +36,9 @@ func TestServerConfig(t *testing.T) {
 			SNIGuard: "strict",
 			ClientCA: "some_ca.crt",
 		},
+		ECH: &serverConfigECH{
+			KeyPath: "some_ech.pem",
+		},
 		ACME: &serverConfigACME{
 			Domains: []string{
 				"sub1.example.com",
@@ -78,8 +81,9 @@ func TestServerConfig(t *testing.T) {
 			BBRProfile: "aggressive",
 		},
 		Bandwidth: serverConfigBandwidth{
-			Up:   "500 mbps",
-			Down: "100 mbps",
+			Up:                      "500 mbps",
+			Down:                    "100 mbps",
+			DisableLossCompensation: true,
 		},
 		IgnoreClientBandwidth: true,
 		SpeedTest:             true,

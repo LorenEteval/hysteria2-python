@@ -11,6 +11,9 @@ tls:
   sniGuard: strict
   clientCA: some_ca.crt
 
+ech:
+  keyPath: some_ech.pem
+
 acme:
   domains:
     - sub1.example.com
@@ -50,6 +53,7 @@ congestion:
 bandwidth:
   up: 500 mbps
   down: 100 mbps
+  disableLossCompensation: true
 
 ignoreClientBandwidth: true
 
