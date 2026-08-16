@@ -1,12 +1,20 @@
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.15)
 project(hysteria2 C CXX)
 
 set(CMAKE_C_STANDARD 99)
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/${PROJECT_NAME})
 
-add_subdirectory(pybind11)
+set(PYBIND11_FINDPYTHON ON)
+find_package(pybind11 3 CONFIG REQUIRED)
+
+if (NOT DEFINED HYSTERIA2_GO_BUILD_DIR)
+    set(HYSTERIA2_GO_BUILD_DIR "${CMAKE_SOURCE_DIR}/gobuild")
+endif ()
+
+if (NOT DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build/lib/${PROJECT_NAME}")
+endif ()
 
 pybind11_add_module(${PROJECT_NAME} src/hysteria2.cpp)
 
@@ -24,12 +32,12 @@ if (WIN32)
 
     target_link_libraries(
         ${PROJECT_NAME} PRIVATE
-        ${CMAKE_SOURCE_DIR}/gobuild/hysteria2.lib
+        "${HYSTERIA2_GO_BUILD_DIR}/hysteria2.lib"
     )
 else ()
     target_link_libraries(
         ${PROJECT_NAME} PRIVATE
-        ${CMAKE_SOURCE_DIR}/gobuild/hysteria2.a
+        "${HYSTERIA2_GO_BUILD_DIR}/hysteria2.a"
         "-lresolv"
     )
 
@@ -42,4 +50,4 @@ else ()
     endif ()
 endif ()
 
-target_include_directories(${PROJECT_NAME} PRIVATE gobuild)
+target_include_directories(${PROJECT_NAME} PRIVATE "${HYSTERIA2_GO_BUILD_DIR}")

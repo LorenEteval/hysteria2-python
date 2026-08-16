@@ -1,94 +1,134 @@
 name: Deploy PyPI
 
-on: [ push, pull_request ]
+on: [push, pull_request]
 
 jobs:
-  build:
-    name: ${{ matrix.os }} Python ${{ matrix.python-version }}
+  build-wheels:
+    name: Wheels (${{ matrix.platform }} ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
+      fail-fast: false
       matrix:
-        os: [ ubuntu-22.04, ubuntu-24.04, windows-2022, windows-2025, macos-15-intel, macos-14, macos-15 ]
-        python-version: [ "3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.13t", "3.14" ]
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+          - os: windows-2022
+            platform: windows
+            arch: AMD64
+          - os: macos-15-intel
+            platform: macos
+            arch: x86_64
+          - os: macos-15
+            platform: macos
+            arch: arm64
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+
+      # Linux builds run in manylinux containers; Go is installed there by
+      # tool.cibuildwheel.linux.before-all in pyproject.toml.
+      - name: Set up Go
+        if: matrix.platform != 'linux'
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.26"
-          check-latest: true
+          go-version: "1.26.5"
+          cache-dependency-path: |
+            hysteria2-go/app/go.sum
+            hysteria2-go/core/go.sum
+            hysteria2-go/extras/go.sum
+
+      - name: Set up MinGW-w64
+        if: matrix.platform == 'windows'
+        uses: egor-tensin/setup-mingw@v3
+        with:
+          platform: x64
+
+      - name: Build and test wheels
+        uses: pypa/cibuildwheel@v3.4.1
+        env:
+          CIBW_ARCHS: ${{ matrix.arch }}
+
+      - name: Store wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-${{ matrix.platform }}-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: Source distribution
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python-version }}
-          check-latest: true
-      - name: Install, build & run sample
+          python-version: "3.13"
+      - name: Build source distribution
         run: |
-          go version
-          python --version
-          python -m pip install --upgrade pip
-          python -m pip install setuptools wheel
-          python setup.py sdist
-          python setup.py install
-          python sample/sample.py
+          python -m pip install --upgrade build
+          python -m build --sdist
+      - name: Store source distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
 
   store:
-    name: Store the distribution packages
-    runs-on: ubuntu-latest
+    name: Store all distribution packages
+    runs-on: ubuntu-24.04
     needs:
-      - build
+      - build-wheels
+      - build-sdist
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Download wheels
+        uses: actions/download-artifact@v8
         with:
-          python-version: "3.11"
-          check-latest: true
-      - name: Install & build
-        run: |
-          python --version
-          python -m pip install --upgrade pip
-          python -m pip install setuptools wheel
-          python setup.py sdist
+          pattern: cibw-wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Download source distribution
+        uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist
       - name: Store the distribution packages
         uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions
-          path: |
-            dist/*.tar.gz
-            dist/*.whl
+          path: dist/*
+          if-no-files-found: error
 
   publish-to-pypi:
-    name: >-
-      Publish Python 🐍 distribution 📦 to PyPI
-    if: startsWith(github.ref, 'refs/tags/')  # only publish to PyPI on tag pushes
+    name: Publish Python distribution to PyPI
+    if: startsWith(github.ref, 'refs/tags/')
     needs:
-      - build
       - store
     runs-on: ubuntu-latest
     environment:
       name: deploy-pypi
       url: https://pypi.org/p/hysteria2
     permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      id-token: write
     steps:
-      - name: Download all the dists
+      - name: Download all distributions
         uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
           path: dist/
-      - name: Publish distribution 📦 to PyPI
+      - name: Publish distribution to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
-    name: >-
-      Upload to GitHub Release
+    name: Upload to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
     needs:
       - publish-to-pypi
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # IMPORTANT: mandatory for making GitHub Releases
-      id-token: write  # IMPORTANT: mandatory for sigstore
+      contents: write
     steps:
-      - name: Download all the dists
+      - name: Download all distributions
         uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
@@ -101,10 +141,9 @@ jobs:
           '${{ github.ref_name }}'
           --repo '${{ github.repository }}'
           --notes ""
-      - name: Upload artifact to GitHub Release
+      - name: Upload distributions to GitHub Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        # Upload to GitHub Release using the `gh` CLI.
         run: >-
           gh release upload
           '${{ github.ref_name }}' dist/**

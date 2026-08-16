@@ -23,7 +23,7 @@ namespace {
         }
     }
 
-    PYBIND11_MODULE(hysteria2, m) {
+    PYBIND11_MODULE(hysteria2, m, py::mod_gil_not_used()) {
         m.def("startFromJSON",
             &startFromJSON,
             "Start Hysteria2 client with JSON",
