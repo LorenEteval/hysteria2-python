@@ -6,31 +6,35 @@ Python bindings for [hysteria2](https://github.com/apernet/hysteria).
 
 ## Install
 
-### Core Building Tools
-
-You have to install the following tools to be able to install this package successfully.
-
-> Note: hysteria2 v2.0.3+ requires at least go 1.21, which means hysteria2-python will also
-> need go 1.21+ to be able to build and install successfully since v2.0.3.
-
-* [go](https://go.dev/doc/install) in your PATH. go 1.20.0 and above is recommended. To check go is ready,
-  type `go version`. Also, if google service is blocked in your region(such as Mainland China), you have to configure
-  your GOPROXY to be able to pull go packages. For Chinese users, refer to [goproxy.cn](https://goproxy.cn/) for more
-  information.
-* [cmake](https://cmake.org/download/) in your PATH. To check cmake is ready, type `cmake --version`.
-* A working GNU C++ compiler(i.e. GNU C++ toolchains). To check GNU C++ compiler is ready, type `g++ --version`. These
-  tools should have been installed in Linux or macOS by default. If you don't have GNU C++ toolchains(especially for
-  Windows users) anyway:
-
-    * For Linux users: type `sudo apt update && sudo apt install g++` and that should work out fine.
-    * For Windows users: install [MinGW-w64](https://sourceforge.net/projects/mingw-w64/files/mingw-w64/)
-      or [Cygwin](https://www.cygwin.com/) and make sure you have add them to PATH.
-
-### Install Package
-
 ```
 pip install hysteria2
 ```
+
+Published releases provide platform-specific binary wheels. On a supported Python, operating system, and architecture,
+pip downloads the matching wheel, so Go, CMake, and a C/C++ compiler are not required for installation.
+
+## Binary Wheel Platforms
+
+Binary wheels are built and tested in [GitHub Actions](https://github.com/LorenEteval/hysteria2-python/actions).
+
+| Platform                  | Architecture    | CPython versions |
+|---------------------------|-----------------|:----------------:|
+| Linux (manylinux2014)     | x86_64, aarch64 |     3.8-3.14     |
+| Windows                   | AMD64           |     3.8-3.14     |
+| Windows 11 ARM            | ARM64           |     3.9-3.14     |
+| macOS 12 and later        | x86_64, arm64   |     3.8-3.14     |
+
+Available free-threaded CPython 3.13 and 3.14 variants are also built. Windows ARM64 starts at Python 3.9 because
+cibuildwheel does not provide a CPython 3.8 ARM64 build.
+
+## Building from Source
+
+Building from source is only necessary when no compatible wheel is available or when modifying the native binding.
+The build requires:
+
+* [Go](https://go.dev/doc/install) 1.25.1 or later in your PATH;
+* a working C/C++ compiler toolchain;
+* MinGW-w64 on Windows AMD64, or LLVM-MinGW on Windows ARM64.
 
 ## API
 
@@ -63,23 +67,6 @@ have. And due to its backward compatibility, there's no plan to generate binding
 To make installation of this package easier, I didn't add the original [hysteria](https://github.com/apernet/hysteria)
 source code as a submodule. To track what modifications have been made to the source code, you can compare it with the
 same version under Python binding and corresponding go repository.
-
-## Tested Platform
-
-hysteria2-python works on all major platform with all Python version(Python 3).
-
-Below are tested build in [github actions](https://github.com/LorenEteval/hysteria2-python/actions).
-
-| Platform     | Python 3.8-Python 3.14 |
-|--------------|:----------------------:|
-| ubuntu 22.04 |   :heavy_check_mark:   |
-| ubuntu 24.04 |   :heavy_check_mark:   |
-| windows-2019 |   :heavy_check_mark:   |
-| windows-2022 |   :heavy_check_mark:   |
-| windows-2025 |   :heavy_check_mark:   |
-| macos-13     |   :heavy_check_mark:   |
-| macos-14     |   :heavy_check_mark:   |
-| macos-15     |   :heavy_check_mark:   |
 
 ## License
 
