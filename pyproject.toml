@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
 enable = ["cpython-freethreading"]
-skip = ["*-musllinux_*"]
+skip = ["*-musllinux_*", "cp38-win_arm64"]
 build = [
     "cp38-*",
     "cp39-*",
@@ -25,16 +25,34 @@ test-sources = ["sample"]
 test-command = "python sample/sample.py"
 
 [tool.cibuildwheel.linux]
-archs = ["x86_64"]
+archs = ["x86_64", "aarch64"]
 manylinux-x86_64-image = "manylinux2014"
-before-all = [
-    "mkdir -p /opt/hysteria2-go",
-    "curl -fsSL https://go.dev/dl/go1.26.5.linux-amd64.tar.gz | tar -xz -C /opt/hysteria2-go --strip-components=1",
-]
+manylinux-aarch64-image = "manylinux2014"
+before-all = """
+case "$(uname -m)" in
+    x86_64)
+        go_arch=amd64
+        go_sha256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+        ;;
+    aarch64)
+        go_arch=arm64
+        go_sha256=fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49
+        ;;
+    *)
+        echo "Unsupported Linux architecture: $(uname -m)" >&2
+        exit 1
+        ;;
+esac
+go_archive="/tmp/go1.26.5.linux-${go_arch}.tar.gz"
+curl -fsSL "https://go.dev/dl/go1.26.5.linux-${go_arch}.tar.gz" -o "${go_archive}"
+echo "${go_sha256}  ${go_archive}" | sha256sum -c -
+mkdir -p /opt/hysteria2-go
+tar -xzf "${go_archive}" -C /opt/hysteria2-go --strip-components=1
+"""
 environment = { PATH="/opt/hysteria2-go/bin:$PATH" }
 
 [tool.cibuildwheel.windows]
-archs = ["AMD64"]
+archs = ["AMD64", "ARM64"]
 
 [tool.cibuildwheel.macos]
 environment = { MACOSX_DEPLOYMENT_TARGET="12.0" }
