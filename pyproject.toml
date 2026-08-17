@@ -8,19 +8,8 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
-enable = ["cpython-freethreading"]
-skip = ["*-musllinux_*", "cp38-win_arm64"]
-build = [
-    "cp38-*",
-    "cp39-*",
-    "cp310-*",
-    "cp311-*",
-    "cp312-*",
-    "cp313-*",
-    "cp313t-*",
-    "cp314-*",
-    "cp314t-*",
-]
+build = "cp3{9,10,11,12,13,14,14t}-*"
+skip = "*-musllinux_*"
 test-sources = ["sample"]
 test-command = "python sample/sample.py"
 
