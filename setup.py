@@ -16,7 +16,7 @@ BINDING_NAME = 'hysteria2'
 
 
 def get_hysteria_version():
-    return '2.12.1.1'
+    return '2.12.2'
 
 
 def get_macos_architecture():
