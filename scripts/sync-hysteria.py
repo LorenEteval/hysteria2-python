@@ -594,15 +594,9 @@ def guard_release(args: argparse.Namespace) -> None:
     print(f"Release target {args.release_tag} is available")
 
 
-def release_notes_text(upstream_tag: str, commit: str) -> str:
+def release_notes_text(upstream_tag: str) -> str:
     parse_upstream_tag(upstream_tag)
-    if COMMIT_PATTERN.fullmatch(commit) is None:
-        raise SyncError(f"Invalid upstream commit: {commit!r}")
-    commit_url = f"https://github.com/{UPSTREAM_REPOSITORY}/commit/{commit}"
-    return (
-        f"Corresponds to hysteria2 {upstream_tag}\n\n"
-        f"Upstream commit: [`{commit}`]({commit_url})\n"
-    )
+    return f"Corresponds to hysteria2 {upstream_tag.removeprefix('app/')}\n"
 
 
 def release_notes_command(args: argparse.Namespace) -> None:
@@ -611,7 +605,7 @@ def release_notes_command(args: argparse.Namespace) -> None:
             f"Release upstream tag {args.upstream_tag} does not match "
             f"{UPSTREAM_VERSION_FILE.name} ({current_upstream_tag()})"
         )
-    notes = release_notes_text(args.upstream_tag, current_upstream_commit())
+    notes = release_notes_text(args.upstream_tag)
     if args.output is None:
         print(notes, end="")
     else:

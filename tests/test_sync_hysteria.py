@@ -210,10 +210,9 @@ class SyncHysteriaTests(unittest.TestCase):
             with self.assertRaisesRegex(SYNC.SyncError, "occupied by: pypi"):
                 SYNC.check_release(args)
 
-    def test_release_notes_use_exact_upstream_tag_and_commit(self):
-        notes = SYNC.release_notes_text("app/v1.0.0", self.commit_100)
-        self.assertIn("Corresponds to hysteria2 app/v1.0.0", notes)
-        self.assertIn(self.commit_100, notes)
+    def test_release_notes_use_downstream_tag_only(self):
+        notes = SYNC.release_notes_text("app/v1.0.0")
+        self.assertEqual(notes, "Corresponds to hysteria2 v1.0.0\n")
 
 
 if __name__ == "__main__":
