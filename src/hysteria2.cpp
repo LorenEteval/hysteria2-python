@@ -23,6 +23,10 @@
 
 #include "hysteria2.h"
 
+#ifndef HYSTERIA2_VERSION
+    #error "HYSTERIA2_VERSION is not defined"
+#endif
+
 namespace py = pybind11;
 
 namespace {
@@ -47,6 +51,6 @@ namespace {
             "Start Hysteria2 client with JSON",
             py::arg("json"));
 
-        m.attr("__version__") = "2.12.2";
+        m.attr("__version__") = HYSTERIA2_VERSION;
     }
 }

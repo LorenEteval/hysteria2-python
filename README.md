@@ -56,17 +56,23 @@ FUNCTIONS
         Start Hysteria2 client with JSON
 ```
 
-## Source Code Modification
+## Upstream Source and Releases
 
-This repository, including the package that distributes to pypi,
-contains [hysteria](https://github.com/apernet/hysteria) source code that's been
-modified to build the binding and specific API. If without explicitly remark, the version of this package corresponds to
-the version of the origin source code tag, so the binding will have full features as the original go distribution will
-have. And due to its backward compatibility, there's no plan to generate bindings for older release of hysteria.
+The [HyNetworks/hysteria](https://github.com/HyNetworks/hysteria) source is
+vendored so source distributions and wheel builds are reproducible without a
+Git submodule or an unpinned branch checkout. `UPSTREAM_VERSION` records the
+exact release tag and `UPSTREAM_COMMIT` records the resolved commit.
 
-To make installation of this package easier, I didn't add the original [hysteria](https://github.com/apernet/hysteria)
-source code as a submodule. To track what modifications have been made to the source code, you can compare it with the
-same version under Python binding and corresponding go repository.
+The vendored upstream files are kept unchanged. Python-binding support is
+implemented by two explicitly project-owned Go files:
+
+* `hysteria2-go/app/cmd/python_binding.go`;
+* `hysteria2-go/app/python_binding.go`.
+
+`scripts/sync-hysteria.py verify` compares every other vendored file and its
+mode with the pinned upstream commit. Scheduled automation detects stable
+upstream releases, imports the exact tag, runs validation, and reuses the
+normal wheel/sdist publishing workflow.
 
 ## License
 

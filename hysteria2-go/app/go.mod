@@ -97,5 +97,3 @@ require (
 replace github.com/apernet/hysteria/core/v2 => ../core
 
 replace github.com/apernet/hysteria/extras/v2 => ../extras
-
-replace github.com/spf13/viper => github.com/LorenEteval/viper v1.16.1

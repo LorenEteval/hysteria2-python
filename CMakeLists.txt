@@ -18,6 +18,13 @@ endif ()
 
 pybind11_add_module(${PROJECT_NAME} src/hysteria2.cpp)
 
+if (NOT DEFINED HYSTERIA2_VERSION)
+    message(FATAL_ERROR "HYSTERIA2_VERSION must be provided by the package build")
+endif ()
+target_compile_definitions(
+    ${PROJECT_NAME} PRIVATE HYSTERIA2_VERSION="${HYSTERIA2_VERSION}"
+)
+
 if (WIN32)
     if (MINGW)
         target_compile_options(${PROJECT_NAME} PRIVATE "-Wa,-mbig-obj")

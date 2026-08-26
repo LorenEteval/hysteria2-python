@@ -1,0 +1,126 @@
+name: Synchronize upstream Hysteria release
+
+on:
+  schedule:
+    - cron: '29 3 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Optional stable app/vX.Y.Z tag (defaults to latest release)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: synchronize-upstream-hysteria
+  cancel-in-progress: false
+
+jobs:
+  synchronize:
+    name: Synchronize exact upstream release
+    if: github.repository == 'LorenEteval/hysteria2-python'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: hysteria2-go/app/go.mod
+          cache-dependency-path: |
+            hysteria2-go/app/go.sum
+            hysteria2-go/core/go.sum
+            hysteria2-go/extras/go.sum
+
+      - name: Detect latest stable release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          args=(check --github-output "$GITHUB_OUTPUT")
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            args+=(--tag "$REQUESTED_TAG")
+          fi
+          python scripts/sync-hysteria.py "${args[@]}"
+
+      - name: Verify current upstream source integrity
+        if: steps.release.outputs.update_required != 'true'
+        run: python scripts/sync-hysteria.py verify
+
+      - name: Import exact upstream release
+        if: steps.release.outputs.update_required == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+        run: python scripts/sync-hysteria.py sync --tag "$UPSTREAM_TAG"
+
+      - name: Validate synchronized source
+        if: steps.release.outputs.update_required == 'true'
+        run: |
+          python scripts/sync-hysteria.py verify
+          python -m unittest discover -s tests -v
+          python - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+          import tomllib
+
+          config = tomllib.loads(
+              pathlib.Path('hysteria2-go/pyproject.toml').read_text(encoding='utf-8')
+          )
+          subprocess.run(
+              [sys.executable, '-m', 'pip', 'install', *config['project']['dependencies']],
+              check=True,
+          )
+          PY
+          (cd hysteria2-go/core && go test -mod=readonly ./...)
+          (cd hysteria2-go/extras && go test -mod=readonly ./...)
+          (cd hysteria2-go/app && go test -mod=readonly ./...)
+          git diff --check
+
+      - name: Commit synchronized source
+        if: steps.release.outputs.update_required == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+        run: |
+          git add --all -- hysteria2-go PACKAGE_VERSION UPSTREAM_COMMIT UPSTREAM_VERSION
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'Synchronization reported an update but produced no commit' >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --signoff --message "chore: sync Hysteria $UPSTREAM_TAG"
+          git push origin HEAD:main
+
+      - name: Select release commit
+        if: steps.release.outputs.release_required == 'true'
+        id: release_commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch build and publication
+        if: steps.release.outputs.release_required == 'true'
+        env:
+          CHECKOUT_REF: ${{ steps.release_commit.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+        run: |
+          gh workflow run deploy-pypi.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            --field checkout_ref="$CHECKOUT_REF" \
+            --field release_tag="$RELEASE_TAG" \
+            --field upstream_tag="$UPSTREAM_TAG"

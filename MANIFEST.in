@@ -1,6 +1,11 @@
 recursive-include gobuild *
 recursive-include hysteria2 *.py
 recursive-include hysteria2-go *
+recursive-include patches *.patch
+recursive-include scripts *.py
 recursive-include src *
 include CMakeLists.txt
+include PACKAGE_VERSION
 include README.md
+include UPSTREAM_COMMIT
+include UPSTREAM_VERSION

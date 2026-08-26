@@ -16,7 +16,7 @@ BINDING_NAME = 'hysteria2'
 
 
 def get_hysteria_version():
-    return '2.12.2'
+    return (ROOT_DIR / 'PACKAGE_VERSION').read_text(encoding='utf-8').strip()
 
 
 def get_macos_architecture():
@@ -92,9 +92,10 @@ class CMakeBuild(build_ext):
         subprocess.run(
             [
                 'go',
-                'build',
                 '-C',
                 str(ROOT_DIR / 'hysteria2-go'),
+                'build',
+                '-mod=readonly',
                 '-o',
                 str(go_build_dir / archive_name),
                 '-buildmode=c-archive',
@@ -116,6 +117,7 @@ class CMakeBuild(build_ext):
             f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir.as_posix()}',
             f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE={extension_dir.as_posix()}',
             f'-DHYSTERIA2_GO_BUILD_DIR={go_build_dir.as_posix()}',
+            f'-DHYSTERIA2_VERSION={get_hysteria_version()}',
             f'-Dpybind11_DIR={pathlib.Path(pybind11.get_cmake_dir()).as_posix()}',
             f'-DPython_EXECUTABLE={pathlib.Path(sys.executable).as_posix()}',
         ]

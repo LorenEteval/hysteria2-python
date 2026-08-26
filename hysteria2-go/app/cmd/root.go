@@ -85,7 +85,7 @@ var logFormatMap = map[string]zapcore.EncoderConfig{
 		NameKey:        "logger",
 		MessageKey:     "msg",
 		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.CapitalLevelEncoder,
+		EncodeLevel:    zapcore.CapitalColorLevelEncoder,
 		EncodeTime:     zapcore.RFC3339TimeEncoder,
 		EncodeDuration: zapcore.SecondsDurationEncoder,
 	},
@@ -110,9 +110,9 @@ func Execute() {
 
 func init() {
 	initFlags()
-	// cobra.MousetrapHelpText = "" // Disable the mousetrap so Windows users can run the exe directly by double-clicking
-	// cobra.OnInitialize(initConfig)
-	// cobra.OnInitialize(initLogger) // initLogger must come after initConfig as it depends on config
+	cobra.MousetrapHelpText = "" // Disable the mousetrap so Windows users can run the exe directly by double-clicking
+	cobra.OnInitialize(initConfig)
+	cobra.OnInitialize(initLogger) // initLogger must come after initConfig as it depends on config
 }
 
 func initFlags() {
@@ -162,10 +162,6 @@ func initLogger() {
 		fmt.Printf("failed to initialize logger: %s\n", err)
 		os.Exit(1)
 	}
-}
-
-func InitLogger() {
-	initLogger()
 }
 
 func envOrDefaultString(key, def string) string {
