@@ -2,7 +2,7 @@ name: Synchronize upstream Hysteria release
 
 on:
   schedule:
-    - cron: '29 3 * * *'
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
