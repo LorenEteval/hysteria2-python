@@ -35,14 +35,6 @@ jobs:
         with:
           python-version: '3.13'
 
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: hysteria2-go/app/go.mod
-          cache-dependency-path: |
-            hysteria2-go/app/go.sum
-            hysteria2-go/core/go.sum
-            hysteria2-go/extras/go.sum
-
       - name: Detect latest stable release
         id: release
         env:
@@ -64,6 +56,17 @@ jobs:
         env:
           UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
         run: python scripts/sync-hysteria.py sync --tag "$UPSTREAM_TAG"
+
+      - name: Set up Go required by synchronized source
+        if: steps.release.outputs.update_required == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: hysteria2-go/app/go.mod
+          check-latest: true
+          cache-dependency-path: |
+            hysteria2-go/app/go.sum
+            hysteria2-go/core/go.sum
+            hysteria2-go/extras/go.sum
 
       - name: Validate synchronized source
         if: steps.release.outputs.update_required == 'true'

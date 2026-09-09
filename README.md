@@ -32,7 +32,8 @@ cibuildwheel does not provide a CPython 3.8 ARM64 build.
 Building from source is only necessary when no compatible wheel is available or when modifying the native binding.
 The build requires:
 
-* [Go](https://go.dev/doc/install) 1.25.1 or later in your PATH;
+* a [Go](https://go.dev/doc/install) toolchain satisfying the version selected by
+  `hysteria2-go/app/go.mod` in your PATH;
 * a working C/C++ compiler toolchain;
 * MinGW-w64 on Windows AMD64, or LLVM-MinGW on Windows ARM64.
 

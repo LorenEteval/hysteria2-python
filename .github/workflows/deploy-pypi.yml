@@ -59,6 +59,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: hysteria2-go/app/go.mod
+          check-latest: true
           cache-dependency-path: |
             hysteria2-go/app/go.sum
             hysteria2-go/core/go.sum
