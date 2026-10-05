@@ -70,6 +70,9 @@ jobs:
 
       - name: Validate synchronized source
         if: steps.release.outputs.update_required == 'true'
+        env:
+          # Test each module without rewriting the imported go.work.sum.
+          GOWORK: 'off'
         run: |
           python scripts/sync-hysteria.py verify
           python -m unittest discover -s tests -v
@@ -90,7 +93,9 @@ jobs:
           (cd hysteria2-go/core && go test -mod=readonly ./...)
           (cd hysteria2-go/extras && go test -mod=readonly ./...)
           (cd hysteria2-go/app && go test -mod=readonly ./...)
-          git diff --check
+          python scripts/sync-hysteria.py verify
+          # HTTP test fixtures require a blank line at the end of the request.
+          git -c core.whitespace=-blank-at-eof diff --check
 
       - name: Commit synchronized source
         if: steps.release.outputs.update_required == 'true'
@@ -98,7 +103,7 @@ jobs:
           UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
         run: |
           git add --all -- hysteria2-go PACKAGE_VERSION UPSTREAM_COMMIT UPSTREAM_VERSION
-          git diff --cached --check
+          git -c core.whitespace=-blank-at-eof diff --cached --check
           if git diff --cached --quiet; then
             echo 'Synchronization reported an update but produced no commit' >&2
             exit 1

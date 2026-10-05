@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/apernet/hysteria/app/v2/internal/tun"
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/spf13/viper"
@@ -101,9 +102,18 @@ func StartFromJSON(jsonConfig string) {
 			return clientTCPRedirect(*config.TCPRedirect, c)
 		})
 	}
+	var tunServer *tun.Server
 	if config.TUN != nil {
+		tunServer, err = newTUNServer(*config.TUN, c)
+		if err != nil {
+			_ = c.Close()
+			logger.Fatal("failed to load client config", zap.Error(err))
+		}
+		// The TUN adds routes and rules to the system, remove them on exit.
+		defer tunServer.Close()
 		runner.Add("TUN", func() error {
-			return clientTUN(*config.TUN, c)
+			logger.Info("TUN listening", zap.String("interface", config.TUN.Name))
+			return tunServer.Serve()
 		})
 	}
 
@@ -123,6 +133,10 @@ func StartFromJSON(jsonConfig string) {
 		if result.OK {
 			logger.Info(result.Msg)
 		} else {
+			// Fatal exits without running deferred cleanup.
+			if tunServer != nil {
+				_ = tunServer.Close()
+			}
 			_ = c.Close()
 			if result.Err != nil {
 				logger.Fatal(result.Msg, zap.Error(result.Err))
