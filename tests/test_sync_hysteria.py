@@ -138,6 +138,40 @@ class SyncHysteriaTests(unittest.TestCase):
         )
         self._verify()
 
+    def test_verify_preserves_crlf_fixture_with_autocrlf_enabled(self):
+        relative = "extras/sniff/testdata/http-chrome153.txt"
+        fixture = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        self._git(self.upstream, "checkout", "--quiet", "app/v1.0.0")
+        upstream_file = self.upstream / relative
+        upstream_file.parent.mkdir(parents=True)
+        upstream_file.write_bytes(fixture)
+        commit = self._commit_upstream("CRLF fixture", "app/v1.0.1")
+        SYNC.write_metadata(SYNC.UPSTREAM_VERSION_FILE, "app/v1.0.1")
+        SYNC.write_metadata(SYNC.UPSTREAM_COMMIT_FILE, commit)
+        vendor_file = SYNC.VENDOR_DIR / relative
+        vendor_file.parent.mkdir(parents=True)
+        vendor_file.write_bytes(fixture)
+        self._git(self.root, "config", "core.autocrlf", "true")
+
+        # Without attributes, Git would commit different bytes even though the
+        # working copy still contains the original CRLF request.
+        with self.assertRaisesRegex(SYNC.SyncError, "Modified upstream files"):
+            self._verify("app/v1.0.1")
+
+        attributes = SCRIPT.parents[1] / ".gitattributes"
+        (self.root / ".gitattributes").write_bytes(attributes.read_bytes())
+        self._verify("app/v1.0.1")
+        self._git(self.root, "add", "--all")
+        self._git(self.root, "diff", "--cached", "--check")
+        blob = SYNC.run(
+            ["git", "show", f":hysteria2-go/{relative}"], cwd=self.root, text=False
+        )
+        self.assertEqual(blob, fixture)
+
+        vendor_file.write_bytes(fixture.replace(b"\r\n", b"\n"))
+        with self.assertRaisesRegex(SYNC.SyncError, "Modified upstream files"):
+            self._verify("app/v1.0.1")
+
     def test_sync_preserves_additions_updates_provenance_and_is_idempotent(self):
         additions = {
             relative: (SYNC.VENDOR_DIR / relative).read_text(encoding="utf-8")

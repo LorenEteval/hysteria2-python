@@ -94,8 +94,7 @@ jobs:
           (cd hysteria2-go/extras && go test -mod=readonly ./...)
           (cd hysteria2-go/app && go test -mod=readonly ./...)
           python scripts/sync-hysteria.py verify
-          # HTTP test fixtures require a blank line at the end of the request.
-          git -c core.whitespace=-blank-at-eof diff --check
+          git diff --check
 
       - name: Commit synchronized source
         if: steps.release.outputs.update_required == 'true'
@@ -103,7 +102,7 @@ jobs:
           UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
         run: |
           git add --all -- hysteria2-go PACKAGE_VERSION UPSTREAM_COMMIT UPSTREAM_VERSION
-          git -c core.whitespace=-blank-at-eof diff --cached --check
+          git diff --cached --check
           if git diff --cached --quiet; then
             echo 'Synchronization reported an update but produced no commit' >&2
             exit 1

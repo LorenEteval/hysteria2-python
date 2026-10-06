@@ -1,0 +1,2 @@
+# Preserve the exact bytes of captured HTTP, TLS, and QUIC traffic.
+/hysteria2-go/extras/sniff/testdata/* -text -whitespace

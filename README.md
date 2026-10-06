@@ -75,6 +75,9 @@ mode with the pinned upstream commit. Scheduled automation detects stable
 upstream releases, imports the exact tag, runs validation, and reuses the
 normal wheel/sdist publishing workflow.
 
+Captured traffic fixtures retain their exact bytes through `.gitattributes`,
+including HTTP CRLF line endings when committing from Windows.
+
 ## License
 
 The license for this project follows its original go repository [hysteria](https://github.com/apernet/hysteria) and is

@@ -323,6 +323,8 @@ def export_upstream(checkout: UpstreamCheckout, destination: pathlib.Path) -> No
     run(
         [
             "git",
+            "-c",
+            "core.autocrlf=false",
             "archive",
             "--format=tar",
             f"--output={archive}",
@@ -395,7 +397,10 @@ def tree_files(root: pathlib.Path) -> list[str]:
 
 def git_blob_hash(path: pathlib.Path, *, filters: bool) -> str:
     command = ["git", "hash-object"]
-    if not filters:
+    if filters:
+        # Absolute Windows paths do not reliably select Git attributes.
+        command.append(f"--path={path.relative_to(ROOT).as_posix()}")
+    else:
         command.append("--no-filters")
     command.append(str(path))
     return str(run(command)).strip()
@@ -469,7 +474,9 @@ def verify_vendor(checkout: UpstreamCheckout) -> None:
         changed = []
         for relative in sorted(expected_paths):
             actual_hash = git_blob_hash(VENDOR_DIR / relative, filters=True)
-            expected_hash = git_blob_hash(expected_root / relative, filters=True)
+            # Keep upstream bytes authoritative; filtering both sides can hide
+            # line-ending conversions that would corrupt the committed blob.
+            expected_hash = git_blob_hash(expected_root / relative, filters=False)
             if actual_hash != expected_hash:
                 changed.append(relative)
         if changed:
